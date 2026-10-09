@@ -99,7 +99,7 @@ func (s *stream) Write(p []byte) (int, error) {
 		}
 		k := len(p)
 		if !s.raw {
-			k = min(k, maxBatch)
+			k = minInt(k, maxBatch)
 		}
 		if err := s.send(p[:k]); err != nil {
 			s.werr = err

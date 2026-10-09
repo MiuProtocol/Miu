@@ -321,7 +321,7 @@ func (l *lane) writeRaw(p []byte) error {
 	l.wmu.Lock()
 	defer l.wmu.Unlock()
 	for len(p) > 0 {
-		seg := p[:min(len(p), maxSeg)]
+		seg := p[:minInt(len(p), maxSeg)]
 		p = p[len(seg):]
 		// Cork the socket between the RAW frame and its data, so that the record of a few dozen bytes
 		// does not travel in a packet of its own.

@@ -183,11 +183,13 @@ func (c *Client) get(ctx context.Context) (l *lane, pooled, used bool, err error
 	c.lastOpen = now
 	warm := 0
 	if burst {
-		warm = max(c.cfg.MinIdle-len(c.idle)-c.pending, 0)
+		if warm = c.cfg.MinIdle - len(c.idle) - c.pending; warm < 0 {
+			warm = 0
+		}
 		c.pending += warm
 	}
 	c.mu.Unlock()
-	for range warm {
+	for i := 0; i < warm; i++ {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), defaultDialTimeout)
 			nl, err := c.dial(ctx)

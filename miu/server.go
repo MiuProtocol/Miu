@@ -50,6 +50,36 @@ type Access struct {
 	Remote  net.Addr // the client's address
 }
 
+// Traffic is what a stream has carried by the time it ends: payload bytes in each direction, and how
+// many of them travelled as raw segments (outside the outer TLS). Raw bytes in a direction mean that
+// the sender of that direction found inner TLS 1.3 traffic and that the receiver can take raw segments.
+type Traffic struct {
+	Up, Down       int64 // client to target, target to client
+	RawUp, RawDown int64 // the part of Up and Down sent as raw segments
+}
+
+type trafficCounter struct {
+	up, down, rawUp, rawDown atomic.Int64
+}
+
+func (t *trafficCounter) addUp(n int, raw bool) {
+	t.up.Add(int64(n))
+	if raw {
+		t.rawUp.Add(int64(n))
+	}
+}
+
+func (t *trafficCounter) addDown(n int, raw bool) {
+	t.down.Add(int64(n))
+	if raw {
+		t.rawDown.Add(int64(n))
+	}
+}
+
+func (t *trafficCounter) snapshot() Traffic {
+	return Traffic{Up: t.up.Load(), Down: t.down.Load(), RawUp: t.rawUp.Load(), RawDown: t.rawDown.Load()}
+}
+
 // ServerConfig configures a Server. Only Users is required.
 type ServerConfig struct {
 	Users []User
@@ -69,6 +99,8 @@ type ServerConfig struct {
 	ListenPacket func(ctx context.Context) (net.PacketConn, error)
 	// OnAccess, when set, is called for every stream before its target is contacted.
 	OnAccess func(Access)
+	// OnClose, when set, is called when a stream has ended, with what it carried.
+	OnClose func(Access, Traffic)
 	// Logf, when set, receives diagnostics (failed dials and the like).
 	Logf func(format string, args ...any)
 }
@@ -163,7 +195,14 @@ func (s *Server) Serve(ctx context.Context, conn net.Conn) error {
 
 	l := newLane(conn, true, !s.cfg.DisableRaw)
 	l.scheme.Store(s.scheme)
-	defer context.AfterFunc(ctx, l.close)()
+	// Close the lane when ctx is done.
+	go func() {
+		select {
+		case <-ctx.Done():
+			l.close()
+		case <-l.done:
+		}
+	}()
 
 	// There is a single frame reading loop. The uplink of a TCP stream (DATA / RAW / END) is handled
 	// right here while its downlink runs in another goroutine, so the loop keeps reading after the
@@ -216,6 +255,7 @@ func (s *Server) Serve(ctx context.Context, conn net.Conn) error {
 					putBuf(b)
 					return nil
 				}
+				cur.traffic.addUp(n, typ == frRaw)
 				if !cur.push(chunk{b, n}) {
 					return nil
 				}
@@ -254,10 +294,11 @@ func (s *Server) Serve(ctx context.Context, conn net.Conn) error {
 				continue
 			}
 			dest := joinHostPort(host, port)
+			access := Access{User: user, Network: "tcp", Target: dest, Remote: conn.RemoteAddr()}
 			if s.cfg.OnAccess != nil {
-				s.cfg.OnAccess(Access{User: user, Network: "tcp", Target: dest, Remote: conn.RemoteAddr()})
+				s.cfg.OnAccess(access)
 			}
-			cur = s.openTCP(ctx, l, dest)
+			cur = s.openTCP(ctx, l, access)
 		default:
 			return fmt.Errorf("miu: unexpected frame type %d", typ)
 		}
@@ -319,14 +360,16 @@ type chunk struct {
 // tcpStream is the TCP stream running on a lane (server side). The lane's read loop feeds the uplink
 // into a queue that one goroutine writes to the target; the downlink has a goroutine of its own.
 type tcpStream struct {
-	s      *Server
-	l      *lane
-	ctx    context.Context
-	cancel context.CancelFunc
-	timer  *activityTimer // closes the lane when both directions have been silent for too long
-	up     chan chunk     // closed at the uplink's END
-	down   chan error     // result of the downlink goroutine
-	state  streamState
+	s       *Server
+	l       *lane
+	ctx     context.Context
+	cancel  context.CancelFunc
+	timer   *activityTimer // closes the lane when both directions have been silent for too long
+	up      chan chunk     // closed at the uplink's END
+	down    chan error     // result of the downlink goroutine
+	state   streamState
+	access  Access
+	traffic trafficCounter
 
 	mu       sync.Mutex
 	target   net.Conn
@@ -343,8 +386,9 @@ type tcpStream struct {
 
 // openTCP starts a TCP stream: the target is dialed in the background, so the read loop stays free to
 // take the uplink (and a RESET) in the meantime.
-func (s *Server) openTCP(ctx context.Context, l *lane, dest string) *tcpStream {
-	st := &tcpStream{s: s, l: l, up: make(chan chunk, upQueue), down: make(chan error, 1)}
+func (s *Server) openTCP(ctx context.Context, l *lane, access Access) *tcpStream {
+	dest := access.Target
+	st := &tcpStream{s: s, l: l, access: access, up: make(chan chunk, upQueue), down: make(chan error, 1)}
 	st.ctx, st.cancel = context.WithCancel(ctx)
 	st.timer = newActivityTimer(s.cfg.StreamTimeout, l.close)
 	go st.run(dest)
@@ -506,6 +550,9 @@ func (st *tcpStream) release() {
 	if !released {
 		st.cancel()
 		st.timer.stop()
+		if st.s.cfg.OnClose != nil {
+			st.s.cfg.OnClose(st.access, st.traffic.snapshot())
+		}
 	}
 }
 
@@ -529,6 +576,7 @@ func (st *tcpStream) pumpDown(target net.Conn) error {
 			if werr := l.writePacket(pkt, appendData((*fb)[:0], (*buf)[:n])); werr != nil {
 				return werr
 			}
+			st.traffic.addDown(n, false)
 			if sw && l.peerRaw.Load() && err == nil {
 				return st.pumpRaw(target, buf, fb)
 			}
@@ -565,6 +613,7 @@ func (st *tcpStream) pumpRaw(target net.Conn, buf, fb *[]byte) error {
 			if werr != nil {
 				return werr
 			}
+			st.traffic.addDown(n, n >= rawMin)
 		}
 		if err != nil {
 			return l.writeFrame(frEnd, nil)
@@ -590,6 +639,7 @@ func (st *tcpStream) pumpSegments(src *net.TCPConn, buf, fb *[]byte) error {
 				if werr := l.writeUnshaped(appendData((*fb)[:0], (*buf)[:k])); werr != nil {
 					return werr
 				}
+				st.traffic.addDown(k, false)
 			}
 			if err != nil {
 				break
@@ -599,11 +649,13 @@ func (st *tcpStream) pumpSegments(src *net.TCPConn, buf, fb *[]byte) error {
 		if !st.beginSegment() {
 			break
 		}
-		err = l.spliceRaw(src, min(n, maxSeg))
+		n = minInt(n, maxSeg)
+		err = l.spliceRaw(src, n)
 		st.endSegment()
 		if err != nil {
 			return err // a segment was cut short: the byte count on the lane is off
 		}
+		st.traffic.addDown(n, true)
 	}
 	return l.writeFrame(frEnd, nil)
 }

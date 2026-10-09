@@ -41,11 +41,20 @@ func appendFrame(b []byte, typ byte, payload []byte) []byte {
 // appendData encodes p as DATA frames of at most maxData bytes each.
 func appendData(dst, p []byte) []byte {
 	for len(p) > 0 {
-		k := min(len(p), maxData)
+		k := minInt(len(p), maxData)
 		dst = appendFrame(dst, frData, p[:k])
 		p = p[k:]
 	}
 	return dst
+}
+
+// minInt is the builtin min of Go 1.21. This package keeps to the language and library of Go 1.20,
+// so that it can be copied into projects that still build with it.
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // parseKV parses a settings text: newline separated key=value pairs.

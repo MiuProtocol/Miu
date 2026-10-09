@@ -17,13 +17,18 @@ type laneDataReader struct {
 	l      *lane
 	eof    bool
 	update func()
+	count  *trafficCounter // may be nil
 }
 
 func (r *laneDataReader) Read(p []byte) (int, error) {
 	for !r.eof {
 		if r.l.pending() {
 			r.update()
-			return r.l.readPayload(p)
+			n, err := r.l.readPayload(p)
+			if r.count != nil {
+				r.count.addUp(n, false)
+			}
+			return n, err
 		}
 		typ, _, err := r.l.next()
 		if err != nil {
@@ -47,7 +52,8 @@ func (s *Server) serveUDP(ctx context.Context, l *lane, user string) error {
 	timer := newActivityTimer(s.cfg.StreamTimeout, l.close)
 	defer timer.stop()
 
-	up := &laneDataReader{l: l, update: timer.update}
+	var traffic trafficCounter
+	up := &laneDataReader{l: l, update: timer.update, count: &traffic}
 	r := bufio.NewReader(up)
 	// finish ends the stream here: END on the downlink, and the uplink dropped up to the client's END.
 	finish := func() error {
@@ -71,9 +77,12 @@ func (s *Server) serveUDP(ctx context.Context, l *lane, user string) error {
 		}
 		return err
 	}
-	dest := joinHostPort(host, port)
+	access := Access{User: user, Network: "udp", Target: joinHostPort(host, port), Remote: l.conn.RemoteAddr()}
 	if s.cfg.OnAccess != nil {
-		s.cfg.OnAccess(Access{User: user, Network: "udp", Target: dest, Remote: l.conn.RemoteAddr()})
+		s.cfg.OnAccess(access)
+	}
+	if s.cfg.OnClose != nil {
+		defer func() { s.cfg.OnClose(access, traffic.snapshot()) }()
 	}
 	pc, err := s.cfg.ListenPacket(ctx)
 	if err != nil {
@@ -107,7 +116,7 @@ func (s *Server) serveUDP(ctx context.Context, l *lane, user string) error {
 
 	down := make(chan error, 1)
 	go func() {
-		err := udpDownlink(l, pc, peer, timer.update)
+		err := udpDownlink(l, pc, peer, timer.update, &traffic)
 		if err != nil {
 			l.close()
 		}
@@ -150,7 +159,7 @@ func (s *Server) serveUDP(ctx context.Context, l *lane, user string) error {
 }
 
 // udpDownlink sends every packet that arrives on pc down the lane as UoT, and END when pc is closed.
-func udpDownlink(l *lane, pc net.PacketConn, peer *net.UDPAddr, update func()) error {
+func udpDownlink(l *lane, pc net.PacketConn, peer *net.UDPAddr, update func(), traffic *trafficCounter) error {
 	buf := make([]byte, 0xffff)
 	var pkt, frames []byte
 	for failures := 0; ; {
@@ -180,6 +189,7 @@ func udpDownlink(l *lane, pc net.PacketConn, peer *net.UDPAddr, update func()) e
 		if err := l.writeUnshaped(frames); err != nil {
 			return err
 		}
+		traffic.addDown(len(pkt), false)
 	}
 }
 

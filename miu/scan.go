@@ -39,7 +39,7 @@ func (s *recScan) feed(b []byte) bool {
 	}
 	for len(b) > 0 {
 		if s.need > 0 {
-			k := min(s.need, len(b))
+			k := minInt(s.need, len(b))
 			if s.inSH {
 				s.sh = append(s.sh, b[:k]...)
 			}
@@ -54,7 +54,7 @@ func (s *recScan) feed(b []byte) bool {
 			}
 			continue
 		}
-		k := min(5-len(s.hdr), len(b))
+		k := minInt(5-len(s.hdr), len(b))
 		s.hdr = append(s.hdr, b[:k]...)
 		b = b[k:]
 		if len(s.hdr) < 5 {

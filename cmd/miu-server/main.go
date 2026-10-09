@@ -114,6 +114,10 @@ func run(cfg config, verbose bool) error {
 	}
 	if verbose {
 		scfg.Logf = log.Printf
+		// Per stream: bytes each way, and how many of them left the outer TLS as raw segments.
+		scfg.OnClose = func(a miu.Access, t miu.Traffic) {
+			log.Printf("%s %v -> %s %s closed: up %d (raw %d), down %d (raw %d)", a.User, a.Remote, a.Network, a.Target, t.Up, t.RawUp, t.Down, t.RawDown)
+		}
 	}
 	for _, u := range cfg.Users {
 		scfg.Users = append(scfg.Users, miu.User{Name: u.Name, PSK: u.PSK})

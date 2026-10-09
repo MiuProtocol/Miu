@@ -16,7 +16,6 @@ import (
 	"math/big"
 	"net"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1056,22 +1055,89 @@ func TestServerPaddingScheme(t *testing.T) {
 	}
 }
 
-func TestAccessCallback(t *testing.T) {
+// The server reports every stream when it opens, and when it ends what it carried — including how much
+// of it travelled as raw segments, which is how an operator (or someone integrating another client)
+// can tell whether raw segments are in use.
+func TestAccessAndTraffic(t *testing.T) {
 	var mu sync.Mutex
-	var seen []string
-	c := pair(t, pairOptions{outer: "tls", server: miu.ServerConfig{OnAccess: func(a miu.Access) {
-		mu.Lock()
-		seen = append(seen, a.User+" "+a.Network+" "+a.Target)
-		mu.Unlock()
-	}}})
-	echo := echoTCP(t)
-	roundTrip(t, c, echo, []byte("x"), nil)
-	mu.Lock()
-	defer mu.Unlock()
-	if len(seen) != 1 || seen[0] != "u@test tcp "+echo {
-		t.Fatalf("access log: %q", seen)
+	var opened []string
+	closed := map[string]miu.Traffic{}
+	c := pair(t, pairOptions{outer: "tls", server: miu.ServerConfig{
+		OnAccess: func(a miu.Access) {
+			mu.Lock()
+			opened = append(opened, a.User+" "+a.Network+" "+a.Target)
+			mu.Unlock()
+		},
+		OnClose: func(a miu.Access, tr miu.Traffic) {
+			mu.Lock()
+			closed[a.Network+" "+a.Target] = tr
+			mu.Unlock()
+		},
+	}})
+	wait := func(key string) miu.Traffic {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+			mu.Lock()
+			tr, ok := closed[key]
+			mu.Unlock()
+			if ok {
+				return tr
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("no close report for %s", key)
+			}
+		}
 	}
-	if !strings.HasPrefix(echo, "127.0.0.1:") {
-		t.Fatal(echo)
+
+	// Plain inner data: counted, none of it raw.
+	echo := echoTCP(t)
+	roundTrip(t, c, echo, random(100<<10), nil)
+	if tr := wait("tcp " + echo); tr.Up != 100<<10 || tr.Down != 100<<10 || tr.RawUp != 0 || tr.RawDown != 0 {
+		t.Fatalf("plain stream: %+v", tr)
+	}
+	mu.Lock()
+	if len(opened) != 1 || opened[0] != "u@test tcp "+echo {
+		t.Fatalf("access log: %q", opened)
+	}
+	mu.Unlock()
+
+	// Inner TLS 1.3: after the handshake nearly everything is raw, in both directions.
+	target, wrap := innerTLSEcho(t)
+	roundTrip(t, c, target, random(1<<20), wrap)
+	if tr := wait("tcp " + target); tr.Up < 1<<20 || tr.Down < 1<<20 || tr.RawUp < 900<<10 || tr.RawDown < 900<<10 || tr.RawUp > tr.Up || tr.RawDown > tr.Down {
+		t.Fatalf("inner TLS stream: %+v", tr)
+	}
+
+	// UDP: the UoT bytes of the session.
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+	go func() {
+		b := make([]byte, 2000)
+		for {
+			n, from, err := udp.ReadFromUDP(b)
+			if err != nil {
+				return
+			}
+			_, _ = udp.WriteToUDP(b[:n], from)
+		}
+	}()
+	pc, err := c.ListenPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = pc.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := pc.WriteTo(random(1000), udp.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	if n, _, err := pc.ReadFrom(make([]byte, 2000)); err != nil || n != 1000 {
+		t.Fatalf("udp echo: %d %v", n, err)
+	}
+	pc.Close()
+	// request header (1 + 7) + packet (7 + 2 + 1000) up; one packet (7 + 2 + 1000) down
+	if tr := wait("udp " + udp.LocalAddr().String()); tr.Up != 8+1009 || tr.Down != 1009 || tr.RawUp+tr.RawDown != 0 {
+		t.Fatalf("udp session: %+v", tr)
 	}
 }

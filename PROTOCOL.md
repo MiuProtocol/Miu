@@ -1,118 +1,155 @@
-# miu 协议(第二版线上格式)
+# The miu protocol (wire format, version 2)
 
-本文是 miu 的线上格式与行为要求,实现以本文为准。
+English | [简体中文](PROTOCOL.zh-CN.md)
 
-目标只有两个:**新连接零等待**(热通道上开流不握手、不等回包),**大流量不减速**(内层 TLS 不重复加密,没有应用层流控,流之间不互相堵)。
+This document is the wire format of miu and the behaviour it requires. Implementations follow this document.
 
-## 1. 模型
+There are only two goals: **no waiting for a new connection** (opening a stream on a warm lane needs no handshake and
+waits for no reply) and **no slowdown for bulk traffic** (the inner TLS is not encrypted twice, there is no
+application-level flow control, and streams do not block one another).
+
+## 1. Model
 
 ```
-通道(lane) = 一条 TCP + 外层 TLS 1.3 / REALITY + 一次认证
-通道状态    空闲(在池里) → 忙(恰好一条流) → 空闲 → …
+lane        = one TCP connection + outer TLS 1.3 / REALITY + one authentication
+lane state    idle (in the pool) → busy (exactly one stream) → idle → …
 ```
 
-- 一条通道同一时间只跑一条流,流结束后回池给下一条用。没有多路复用,所以没有流控窗口,背压完全交给 TCP。
-- 通道上交替出现两种东西:外层 TLS 记录里的**帧**,与 RAW 帧之后不经外层 TLS、直接写在 TCP 上的**裸段**。
-- 外层不是直连的 TLS / REALITY(明文、ws、经反代终结 TLS)时没有裸段,其余照常。
+- A lane carries one stream at a time and goes back to the pool when the stream ends. There is no multiplexing, hence
+  no flow-control windows; back-pressure is left entirely to TCP.
+- Two kinds of things alternate on a lane: **frames** inside outer TLS records, and **raw segments** that follow a RAW
+  frame and are written directly on TCP, bypassing the outer TLS.
+- When the outer layer is not a TLS / REALITY connection sitting directly on TCP (plaintext, WebSocket, TLS terminated
+  by a reverse proxy), there are no raw segments; everything else is the same.
 
-## 2. 认证头(外层握手完成后客户端发的第一段字节)
+## 2. Authentication header (the first bytes the client sends after the outer handshake)
 
 ```
 token(32) · padlen(u16 BE) · padding(padlen)
-token = sha256(psk 字符串)        // 设定里的字符串去掉首尾空白后的 UTF-8 字节,不做 base64 解码
+token = sha256(psk string)        // the UTF-8 bytes of the configured string with leading and trailing whitespace removed; not base64-decoded
 ```
 
-- 服务端按 token 查表定位用户;查不到直接关连接。两端的 psk 字符串必须逐字节相同。
-- `padlen` 取 padding scheme 第 0 项(默认 30)。
-- 认证头之后紧跟 Settings 帧(同一次写出),然后客户端随时可以开流,**不等任何回包**。
+- The server looks the user up by token and closes the connection when there is no match. The psk string must be
+  byte-for-byte identical on both ends.
+- `padlen` is entry 0 of the padding scheme (30 by default).
+- The Settings frame follows the authentication header immediately (in the same write). After that the client may open
+  a stream at any time, **without waiting for any reply**.
 
-## 3. 帧
+## 3. Frames
 
 ```
 type(1) · len(u16 BE) · payload
 ```
 
-| type | 名称 | 方向 | payload |
+| type | Name | Direction | payload |
 |---|---|---|---|
-| 0 | PAD | 双向 | 任意,丢弃 |
-| 1 | Settings | C→S | 文本 |
-| 2 | ServerSettings | S→C | 文本 |
-| 3 | UpdatePaddingScheme | S→C | scheme 文本 |
-| 4 | OPEN | C→S | socksAddr 目标 |
-| 5 | DATA | 双向 | 数据(只经外层 TLS 加密这一次) |
-| 6 | RAW | 双向 | u32 BE = N。**必须是所在 TLS 记录的最后一帧**;其后 TCP 上紧跟 N 个裸字节,然后回到 TLS 记录 |
-| 7 | END | 双向 | 空。本方向的数据到此结束 |
-| 8 | RESET | C→S | 空。中止这条流:上行到此为止(等同 END),请服务端尽快停掉下行并发 END |
+| 0 | PAD | both | anything; discarded |
+| 1 | Settings | C→S | text |
+| 2 | ServerSettings | S→C | text |
+| 3 | UpdatePaddingScheme | S→C | scheme text |
+| 4 | OPEN | C→S | target as a socksAddr |
+| 5 | DATA | both | data (encrypted once, by the outer TLS only) |
+| 6 | RAW | both | u32 BE = N. **Must be the last frame of its TLS record**; N raw bytes follow on TCP, then TLS records resume |
+| 7 | END | both | empty. The data of this direction ends here |
+| 8 | RESET | C→S | empty. Abort this stream: the uplink ends here (as with END), and the server is asked to stop the downlink as soon as possible and send END |
 
-- 帧可以跨 TLS 记录(接收方按字节流解帧),唯一的例外是 RAW:发送方让它单独占一条记录;接收方只要求它是所在记录的最后一帧。
-- 地址编码(socksAddr):`family(1) · addr · port(u16 BE)`,family 0x01 IPv4(4 B)/ 0x03 域名(len(1)+bytes)/ 0x04 IPv6(16 B)。
-- 没有流 id、没有 SYNACK、没有心跳。
+- A frame may span TLS records (the receiver parses frames from the byte stream). The one exception is RAW: the sender
+  puts it in a record of its own; the receiver only requires that it is the last frame of its record.
+- Address encoding (socksAddr): `family(1) · addr · port(u16 BE)`, with family 0x01 IPv4 (4 B) / 0x03 domain name
+  (len(1)+bytes) / 0x04 IPv6 (16 B).
+- There are no stream ids, no SYNACK and no heartbeats.
 
-## 4. settings(换行分隔 key=value)
-
-```
-C→S  v=2 · raw=0|1 · padding-md5=<本方 scheme 的 md5 hex>
-S→C  v=2 · raw=0|1 · idle=<服务端保留空闲通道的秒数>
-```
-
-- `raw`:本方能不能**接收**裸段(外层是直连的 TLS / REALITY 才能)。对端声明 `raw=1` 之后才可以向它发 RAW。
-  客户端不用专门等 ServerSettings:它要发裸段时(内层握手之后)ServerSettings 早已到了。
-- 服务端发现 `padding-md5` 与自己的方案不同,在 ServerSettings 后面跟一帧 UpdatePaddingScheme。
-- ServerSettings / UpdatePaddingScheme / PAD 可能出现在任何位置,读帧的地方都要认。
-
-## 5. 一条流
+## 4. Settings (newline-separated key=value)
 
 ```
-C→S  OPEN(目标) · DATA(App 的首批字节,有的话)          // 同一个包,立刻发出
-…    两个方向各自:DATA* → (RAW N · N 个裸字节)* → END
-双方都发过 END → 通道空闲,客户端把它放回池里,下一条流从 OPEN 开始
+C→S  v=2 · raw=0|1 · padding-md5=<md5 hex of this side's scheme>
+S→C  v=2 · raw=0|1 · idle=<seconds the server keeps an idle lane>
 ```
 
-- 服务端不对 OPEN 回应;连不上目标时下行直接 END,上行读到客户端的 END 为止全部丢弃。
-- 半关闭:一个方向的数据源结束就发 END,另一个方向照常。
-- 某一端写不进本地的另一头(对方已经关了)时,仍然要把通道上这个方向读到 END 并丢弃,通道才能接着用。
-- 空闲满 `idle` 秒没有 OPEN,服务端关通道。
+- `raw`: whether this side can **receive** raw segments (only when the outer layer is TLS / REALITY directly on TCP).
+  RAW may be sent to a peer only after it has declared `raw=1`. The client does not need to wait for ServerSettings on
+  purpose: by the time it wants to send a raw segment (after the inner handshake) ServerSettings has long arrived.
+- When the server sees a `padding-md5` different from its own scheme, it follows ServerSettings with an
+  UpdatePaddingScheme frame.
+- ServerSettings / UpdatePaddingScheme / PAD may appear anywhere; every place that reads frames must accept them.
 
-### 5.1 什么时候走裸段
+## 5. A stream
 
-每个方向由发送方决定,条件与 XTLS-Vision 的切直通相同,但按字节流跟踪内层 TLS 的记录边界,不要求某一次读恰好对齐:
+```
+C→S  OPEN(target) · DATA(the application's first bytes, if any)          // one packet, sent immediately
+…    in each direction: DATA* → (RAW N · N raw bytes)* → END
+both sides have sent END → the lane is idle; the client puts it back in the pool and the next stream starts with OPEN
+```
 
-1. 沿途解析这个方向内层数据的记录头(5 字节:type · 0x03 · ver · len)。第一个记录不像 TLS(第 2 字节不是 0x03,
-   或 type 不在 0x14–0x17)→ 这条流永远走 DATA。看过 64 KiB 还没到下面第 3 步 → 同样放弃。
-2. 下行方向遇到 ServerHello(握手记录,消息类型 2)且 supported_versions 扩展选了 0x0304 → 记下「内层是 TLS 1.3」。
-   客户端从收到的 DATA 里认(它的上行要用这个结论)。
-3. 「内层是 TLS 1.3」成立之后,在记录边界上遇到 type = 0x17 的记录头:含这个记录头的那一批数据仍走 DATA,
-   **此后这个方向进入裸段阶段**,直到 END,不再检查内容。前提是对端声明了 `raw=1`。
-4. 裸段阶段里每一批数据由发送方自选 RAW 或 DATA(接收方两种随时都要认)。小于 4 KiB 的一批走 DATA:
-   RAW 帧自己要占一条记录,小数据走裸段包数翻倍,省下的那点加密不值。
+- The server does not answer OPEN. When it cannot reach the target, the downlink is just END, and the uplink is
+  discarded until the client's END.
+- Half-close: a direction sends END when its data source ends; the other direction carries on.
+- When one end can no longer write to its local peer (which has already closed), it must still read that direction on
+  the lane up to END and discard it; only then can the lane be used again.
+- When a lane has been idle for `idle` seconds without an OPEN, the server closes it.
+- The end of a stream (END) and a broken connection are different things: if the connection breaks before a direction
+  has received END, that is an error for the layer above, not a normal end.
 
-所以明文、内层握手的明文部分、TLS 1.2 都留在外层 TLS 里;裸段里只有内层 TLS 1.3 的密文记录。
+### 5.1 When raw segments are used
 
-### 5.2 裸段
+The sender of each direction decides. The condition is the same as XTLS-Vision's switch to direct copy, but the record
+boundaries of the inner TLS are tracked on the byte stream, so no single read has to happen to be aligned:
 
-- 发送方手里有多少字节就声明多少(上限 1 MiB 一段),先写一条只含 RAW 帧的记录,再把字节直接写到 TCP。
-  能做到的话让这两次写合并发出(Linux 的 TCP_CORK,或拼成一次写),别让那条几十字节的记录单独占一个包。
-- 接收方读到 RAW 帧后,从 TCP 上取走恰好 N 个字节(先取 TLS 层已经读进缓冲的,再读 socket),然后回到读 TLS 记录。
-- 裸段不受外层 TLS 的校验保护,被改动时由内层 TLS 自己发现;字节数错位会让下一条外层记录解不开,通道随之关闭。
+1. Parse the record headers of this direction's inner data as it passes (5 bytes: type · 0x03 · ver · len). If the
+   first record does not look like TLS (the second byte is not 0x03, or type is outside 0x14–0x17) → this stream uses
+   DATA for good. If 64 KiB have passed without reaching step 3 below → give up likewise.
+2. When the downlink shows a ServerHello (a handshake record, message type 2) whose supported_versions extension selects
+   0x0304 → note that "the inner layer is TLS 1.3". The client recognises this in the DATA it receives (its uplink
+   depends on this conclusion).
+3. Once "the inner layer is TLS 1.3" holds, when a record header with type = 0x17 is met at a record boundary: the
+   batch that contains this record header still goes as DATA, and **from then on this direction is in the raw phase**
+   until END, with no further inspection of the content. The peer must have declared `raw=1`.
+4. In the raw phase the sender chooses RAW or DATA for each batch (the receiver must accept either at any time). A batch
+   smaller than 4 KiB goes as DATA: a RAW frame takes a record of its own, so small data would double the packet count,
+   and the little encryption saved is not worth it.
 
-### 5.3 中止
+So plaintext, the plaintext part of the inner handshake, and TLS 1.2 stay inside the outer TLS; raw segments hold only
+inner TLS 1.3 ciphertext records.
 
-客户端不想要这条流了(App 关了连接、测速读够了、UDP 会话到期):发 RESET,然后把下行读到服务端的 END 为止并丢弃,
-通道照样回池。**不要一中止就关通道**——这些情况很常见,每次废一条通道,池子就留不住热连接。
+### 5.2 Raw segments
 
-- RESET 可以在上行 END 之前发(代替 END),也可以在上行 END 之后补发(App 先半关、随后整个关掉,是最常见的顺序);
-  只要还没收到下行的 END 就可以发。OPEN 还没发出去就中止的,什么都不用发。
-- 服务端收到 RESET:停掉这条流(目标连接关掉),下行在当前这一段之后发 END。正在往连接上搬一个裸段时,
-  等这一段搬完再停——声明过的字节数必须补齐,否则通道错位。流已经结束之后才到的 RESET 忽略。
-- 客户端等 END 设个期限(3 s),到点还没等到才关通道。服务端读循环在一条流的上行 END 之后仍要继续读帧(才收得到补发的 RESET)。
-- 不认识 RESET 的服务端会按协议错误关掉通道,效果等同于「中止 = 关通道」。
-- 中继往本地另一头写不进去(对方已经关了)也按中止处理:发 RESET,别把剩下的下行白白收完。
+- The sender declares as many bytes as it has at hand (at most 1 MiB per segment): it first writes a record holding
+  only the RAW frame, then writes the bytes directly to TCP. Where possible, let the two writes leave together
+  (TCP_CORK on Linux, or a single combined write) so that the record of a few dozen bytes does not take a packet of its
+  own.
+- After reading a RAW frame, the receiver takes exactly N bytes from TCP (first those the TLS layer has already read
+  into its buffer, then from the socket) and goes back to reading TLS records.
+- Raw segments are not protected by the outer TLS's integrity check; tampering is detected by the inner TLS itself. A
+  wrong byte count makes the next outer record undecryptable, and the lane is closed as a result.
 
-## 6. 包长整形
+### 5.3 Abort
 
-沿用 AnyTLS 的 padding scheme 文本格式(`stop=N` 与 `<idx>=<a>-<b>[,c,<a>-<b>…]`),内建默认方案,服务端可下发覆盖。
+When the client no longer wants the stream (the application closed the connection, a speed test has read enough, a UDP
+session expired): send RESET, then read the downlink up to the server's END and discard it; the lane goes back to the
+pool as usual. **Do not close the lane just because a stream is aborted** — these cases are common, and discarding a
+lane each time means the pool never keeps warm connections.
 
-默认方案:
+- RESET may be sent before the uplink END (in place of it) or after the uplink END (the application half-closes first
+  and then closes entirely; this is the most common order). It may be sent as long as the downlink END has not been
+  received. If the stream is aborted before OPEN was sent, nothing needs to be sent. If it is aborted after the
+  downlink END has been received while the uplink is still open, there is nothing left to abort: send END to finish
+  the uplink, not RESET.
+- On RESET the server stops the stream (closes the connection to the target) and sends END on the downlink after the
+  segment in progress. If it is in the middle of moving a raw segment onto the connection, it finishes that segment
+  first — the declared byte count must be delivered in full, otherwise the lane is out of sync. A RESET that arrives
+  after the stream has ended is ignored.
+- The client waits for END with a deadline (3 s) and closes the lane only when the deadline passes. The server's read
+  loop must keep reading frames after a stream's uplink END (otherwise it cannot receive a RESET sent afterwards).
+- A server that does not know RESET closes the lane as a protocol error, which amounts to "abort = close the lane".
+- When a relay can no longer write to its local peer (which has already closed), treat it as an abort too: send RESET
+  rather than receiving the rest of the downlink for nothing.
+
+## 6. Packet-length shaping
+
+The text format of AnyTLS's padding scheme is reused (`stop=N` and `<idx>=<a>-<b>[,c,<a>-<b>…]`). There is a built-in
+default scheme, and the server may push one to replace it.
+
+The default scheme:
 
 ```
 stop=8
@@ -126,52 +163,73 @@ stop=8
 7=500-1000
 ```
 
-- 第 0 项:认证头后的 padding 长度。
-- **每条流、每个方向**的包序号从 1 起。DATA 阶段的每一批数据是一个包(客户端的第 1 个包 = OPEN · 首批 DATA);
-  序号 < stop 的包按方案切成规定长度的 TLS 记录,不够的用 PAD 帧补齐,方案走完还有剩的整段跟在最后。
-  `c` 表示「数据已经发完就到此为止,否则继续往下切」。
-- RAW 帧与裸段不整形(进入裸段之后也就没有「包」了)。
-- **END 不整形,而且是这个方向的最后一个字节**:END 之后不得再有 PAD 或任何记录。通道回池之后才到的字节,
-  会被对端当成「服务端在关这条通道」而把通道丢掉。
-- `padding-md5` 是方案文本字节的 md5(hex 小写)。默认方案的文本就是上面 9 行以 `\n` 连接、末尾没有换行;
-  服务端下发的方案按 UpdatePaddingScheme 帧里的字节算。
+- Entry 0: the length of the padding after the authentication header.
+- Packet numbers start at 1 **per stream and per direction**. Each batch of data in the DATA phase is one packet (the
+  client's packet 1 = OPEN · first DATA). A packet whose number is below stop is cut into TLS records of the prescribed
+  lengths, filled up with PAD frames where the data is short; whatever is left when the scheme runs out follows in one
+  piece. `c` means "stop here if the data has all been sent, otherwise keep cutting".
+- RAW frames and raw segments are not shaped (once in the raw phase there are no "packets" any more).
+- **END is not shaped, and it is the last byte of its direction**: no PAD and no record of any kind may follow END.
+  Bytes that arrive after the lane has gone back to the pool are taken by the peer as "the server is closing this
+  lane", and the lane is dropped.
+- `padding-md5` is the md5 of the scheme text bytes (lowercase hex). The text of the default scheme is the 9 lines
+  above joined with `\n`, without a trailing newline; for a scheme pushed by the server it is computed over the bytes in
+  the UpdatePaddingScheme frame.
 
-## 7. UDP(UoT v2,线上格式与 sing 一致)
+## 7. UDP (UoT v2; the wire format is the same as sing's)
 
-- OPEN 的目标写 `sp.v2.udp-over-tcp.arpa:0`;流里的字节是:请求头 `isConnect(1) · socksAddr(目标)`,
-  之后逐包 `[uotAddr(非 connect 时)] · len(u16 BE) · payload`;uotAddr family 0x00 IPv4 / 0x01 IPv6 / 0x02 域名。
-- 全程走 DATA,包可以跨帧。服务端每条 UoT 流一个 UDP socket,入向任意来源的包都带来源地址回送(full-cone)。
-- 通道是独占的,UDP 流不会被别的流的丢包重传堵住。
+- The target in OPEN is `sp.v2.udp-over-tcp.arpa:0`. The bytes in the stream are: a request header
+  `isConnect(1) · socksAddr(target)`, then for each packet `[uotAddr (when not connect)] · len(u16 BE) · payload`;
+  uotAddr family 0x00 IPv4 / 0x01 IPv6 / 0x02 domain name. When not connect, the target in the request header is the
+  destination of the first packet; every packet after that carries its own address.
+- DATA is used throughout, and a packet may span frames. The server uses one UDP socket per UoT stream and sends back
+  inbound packets from any source together with their source address (full-cone).
+- The lane is exclusive, so a UDP stream is never blocked by another stream's loss and retransmission.
 
-## 8. 通道池(客户端)
+## 8. Lane pool (client)
 
-| 项 | 值 |
+| Item | Value |
 |---|---|
-| 空闲通道保留 | 最新放回的 4 条 120 s,其余 30 s;都不超过服务端下发的 `idle` − 5 s(服务端默认 `idle` = 180) |
-| 空闲通道上限 | 32 条(内存紧的移动设备可以取 16),超出关最旧的 |
-| 预热 | 上一次开流在 10 s 之内时,把空闲通道补到 2 条(握完外层、发完认证头与 Settings 就放着) |
-| 取用 | 后进先出;取之前不读数据地看一眼,对端已关就丢掉换下一条 |
-| 开流 | 等 App 首批数据最多 10 ms,等到了与 OPEN 并进同一个包;等不到 OPEN 单独先发 |
+| Idle lane retention | The 4 most recently returned lanes for 120 s, the rest for 30 s; never more than the server's `idle` − 5 s (the server's default `idle` is 180) |
+| Idle lane limit | 32 (16 is reasonable on memory-constrained mobile devices); beyond that the oldest is closed |
+| Pre-warming | When the previous stream was opened within the last 10 s, top the idle lanes up to 2 (complete the outer handshake, send the authentication header and Settings, and leave them there) |
+| Taking a lane | Last in, first out. Before taking one, peek without reading data; if the peer has closed it, drop it and try the next |
+| Opening a stream | Wait at most 10 ms for the application's first data and merge it into the same packet as OPEN; if none arrives, send OPEN on its own |
 
-- 留 4 条到 120 s 的理由:两次点击之间常常隔半分钟以上,池子空了下一次又要握手;空闲通道不发心跳,多留几条不花什么。
-- 用过的通道空闲时不该再有数据进来:有就是服务端在关它,丢掉。
-- 网络切换(Wi-Fi ↔ 蜂窝)之后池里的通道都是死的,应当整池清掉。
-- 死通道重放(建议做):取用前的那一眼看不出所有死掉的通道(NAT 表项过期、对端静默消失)。流是在池里取的通道上开的、
-  还没收到这条流的任何下行、已发的上行不超过 64 KiB 时,写或读失败就把池清掉、新拨一条通道,把 OPEN 与已发的上行
-  (上行已经 END 的话连 END)原样重发一次;只重放一次,App 无感。
+- Why 4 lanes are kept for 120 s: two clicks are often more than half a minute apart, and with an empty pool the next
+  one needs a handshake again. Idle lanes send no heartbeats, so keeping a few more costs almost nothing.
+- No data should arrive on a used lane while it is idle: if it does, the server is closing the lane; drop it. This
+  does not apply to a pre-warmed lane that has never been used: the server's ServerSettings stays unread in the
+  socket, so seeing data in the peek before use is normal there.
+- After a network change (Wi-Fi ↔ cellular) every lane in the pool is dead; empty the whole pool.
+- Replay on a dead lane (recommended): the peek before use does not reveal every dead lane (an expired NAT entry, a peer
+  that vanished silently). If the stream was opened on a lane taken from the pool, has not yet received any downlink,
+  and has sent no more than 64 KiB of uplink, then on a write or read failure empty the pool, dial a new lane and resend
+  OPEN and the uplink sent so far (including END if the uplink has already ended) exactly once. Replay only once; the
+  application does not notice.
 
-## 9. 实现提示
+## 9. Implementation notes
 
-- **读帧不能多读**。帧按需读、读多少取多少;用带缓冲的读取器会把 RAW 帧后面的裸字节也当成 TLS 明文读走。
-- **Go 的 crypto/tls(含 uTLS、REALITY 这些保持同样结构的分支)**:`Read` 把一条记录读空之后会偷看缓冲里的下一个字节,
-  是 0x15 就当 alert 记录解析;裸段的首字节可能是任何值。做法:RAW 帧体的前 3 个字节照常 `Read`,最后 1 个直接从连接的
-  `input` 缓冲里取走,不让 `Read` 把记录读空。裸段先从 `rawInput` 取(TLS 层读 socket 时会多读,裸段的开头常常已经在里面),
-  再读底层连接;读底层连接时不要超过这一段剩下的字节数,或者把读过头的字节塞回 `rawInput`。
-  这两个缓冲是未导出字段,只能用反射取;换了 Go 版本应当先自检(发一段首字节是 0x15 的裸段看能不能原样收到),
-  取不到或自检不过就声明 `raw=0`。
-- 读超时之后要能接着读:Go 的 TLS 连接读超时不破坏读状态,帧头读到一半的进度由实现自己留住。
-  写超时则会让 TLS 写状态作废,那条通道只能关掉。
-- 裸段的字节不经过连接上的流量统计包装,要统计就得手工记进去。
-- 没有处理外层的 KeyUpdate:已知实现用的 TLS 栈都不会主动发。
-- 服务端下行在 Linux 上可以零拷贝:先问目标连接的接收缓冲里现在有多少字节(FIONREAD),按这个数写 RAW 帧,
-  再用 splice 把恰好这么多字节搬到客户端连接——它们已经在内核里,声明了就一定搬得完。中止时要等手上这一段搬完再关目标连接。
+- **Never read past a frame.** Read frames on demand and take exactly what was read. A buffered reader would also
+  swallow the raw bytes that follow a RAW frame, as if they were TLS plaintext.
+- **Go's crypto/tls (including forks that keep the same structure, such as uTLS and REALITY)**: once `Read` has drained
+  a record it peeks at the next byte in the buffer and, if that byte is 0x15, parses it as an alert record; the first
+  byte of a raw segment can be anything. What to do: read the first 3 bytes of the RAW frame body with `Read` as usual,
+  and take the last one directly from the connection's `input` buffer, so that `Read` never drains the record. Take the
+  raw segment from `rawInput` first (the TLS layer over-reads from the socket, so the beginning of the segment is often
+  already there), then read the underlying connection; when reading the underlying connection, do not read more than
+  what is left of this segment, or push the surplus back into `rawInput`. These two buffers are unexported fields and
+  can only be reached by reflection. After a change of Go version, run a self-test first (send a raw segment whose first
+  byte is 0x15 and check that it arrives unchanged); if the buffers cannot be reached or the self-test fails, declare
+  `raw=0`.
+- It must be possible to keep reading after a read timeout: a read timeout does not damage the read state of a Go TLS
+  connection, and the implementation itself keeps the progress of a half-read frame header. A write timeout, however,
+  invalidates the TLS write state, and that lane can only be closed.
+- The bytes of raw segments do not pass through any traffic-counting wrapper on the connection; to count them, account
+  for them by hand.
+- KeyUpdate on the outer layer is not handled: none of the TLS stacks used by known implementations sends it on its
+  own.
+- The server's downlink can be zero-copy on Linux: first ask how many bytes are in the receive buffer of the target
+  connection right now (FIONREAD), write a RAW frame for that number, then splice exactly that many bytes to the client
+  connection — they are already in the kernel, so what was declared can always be delivered. On an abort, finish the
+  segment in hand before closing the connection to the target.

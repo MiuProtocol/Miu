@@ -3,7 +3,7 @@ package miu
 import (
 	"crypto/md5"
 	"encoding/hex"
-	"math/rand/v2"
+	"math/rand"
 	"strconv"
 	"strings"
 )
@@ -87,7 +87,7 @@ func (p *paddingScheme) sizesFor(pkt uint32) []int {
 			sizes = append(sizes, lo)
 			continue
 		}
-		sizes = append(sizes, lo+rand.IntN(hi-lo))
+		sizes = append(sizes, lo+rand.Intn(hi-lo))
 	}
 	return sizes
 }

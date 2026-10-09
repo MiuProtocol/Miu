@@ -4,46 +4,56 @@
 
 <h1 align="center">Miu</h1>
 
+<p align="center">English | <a href="README.zh-CN.md">简体中文</a></p>
+
 <p align="center">
-  跑在 TLS 1.3 / REALITY 之上的代理协议:连接池代替多路复用,内层已经是 TLS 1.3 密文的数据不再加密第二遍。
+  A proxy protocol on top of TLS 1.3 / REALITY: a connection pool instead of multiplexing, and data that is already TLS 1.3 ciphertext is not encrypted a second time.
 </p>
 
-本仓库是 Miu 的独立 Go 实现:一个库、一个服务端程序 `miu-server`、一个客户端程序 `miu-client`(本地 SOCKS5)。
+This repository is the standalone Go implementation of Miu: a library, a server program `miu-server`, and a client program `miu-client` (local SOCKS5).
 
-线上格式与行为要求见 [PROTOCOL.md](PROTOCOL.md)。
+The wire format and the required behaviour are specified in [PROTOCOL.md](PROTOCOL.md).
 
-## 特点
+## Features
 
-- **通道池**。一条通道 = 一条 TCP + 外层 TLS + 一次认证,同一时间只跑一条流,流结束后回池给下一条用。
-  热通道上开流不握手、不等回包:OPEN 与应用的首批数据在同一个包里发出。没有多路复用,也就没有流控窗口、
-  没有流与流之间的队头阻塞,背压完全交给 TCP。
-- **内层 TLS 1.3 原样转发**。沿途跟踪内层 TLS 的记录边界,握手过后,内层的密文记录不再套外层加密:
-  一条只含 RAW 帧的记录声明字节数,其后原样写在 TCP 上。明文、内层握手的明文部分、TLS 1.2 仍然留在外层加密里。
-  Linux 上服务端的下行用 splice,数据不进用户态。
-- **中止不废通道**。应用关掉连接时客户端发 RESET,把剩下的下行丢到服务端的 END 为止,通道照样回池。
-- 每条流开头的几个包按 padding scheme 整形(AnyTLS 的方案格式,服务端可下发);UDP 走流里的 UoT v2,每个会话独占一条通道。
-- 池里取到的通道已经死了(NAT 过期之类)时,还没收到下行、发得不多的流会在新通道上自动重放一次。
+- **Lane pool.** A lane is one TCP connection + outer TLS + one authentication. It carries one stream at a time and goes
+  back to the pool when the stream ends. Opening a stream on a warm lane needs no handshake and waits for no reply:
+  OPEN and the application's first bytes leave in the same packet. There is no multiplexing, so there are no
+  flow-control windows and no head-of-line blocking between streams; back-pressure is left entirely to TCP.
+- **Inner TLS 1.3 forwarded as is.** The record boundaries of the inner TLS are tracked along the way. After the inner
+  handshake, inner ciphertext records are no longer wrapped in the outer encryption: one record holding only a RAW frame
+  declares a byte count, and that many bytes follow directly on TCP. Plaintext, the plaintext part of the inner
+  handshake, and TLS 1.2 stay inside the outer encryption. On Linux the server's downlink uses splice, so the data never
+  enters user space.
+- **Aborting does not waste the lane.** When the application closes a connection the client sends RESET, discards the
+  rest of the downlink up to the server's END, and the lane goes back to the pool.
+- The first few packets of each stream are shaped by a padding scheme (AnyTLS's scheme format; the server can push its
+  own). UDP runs as UoT v2 inside a stream, one lane per session.
+- If a lane taken from the pool turns out to be dead (an expired NAT entry and the like), a stream that has not received
+  any downlink yet and has not sent much is replayed once on a fresh lane.
 
-## 构建
+## Build
 
-需要 Go 1.24 或更新的版本。
+Go 1.24 or newer is required.
 
 ```sh
 go build -o bin/ ./cmd/...
 ```
 
-得到 `bin/miu-server` 与 `bin/miu-client`。交叉编译照常用 `GOOS` / `GOARCH`(Linux、macOS、Windows 都能编)。
+This produces `bin/miu-server` and `bin/miu-client`. Cross-compile with `GOOS` / `GOARCH` as usual (Linux, macOS and
+Windows all build).
 
-依赖只有两个:[uTLS](https://github.com/refraction-networking/utls)(客户端的浏览器指纹与 REALITY 握手)和
-[xtls/reality](https://github.com/xtls/reality)(服务端的 REALITY 握手)。只用 `miu` 这个库包、外层用标准库 TLS 的程序两个都不会链接进去。
+There are only two dependencies: [uTLS](https://github.com/refraction-networking/utls) (browser fingerprint and the
+REALITY handshake on the client) and [xtls/reality](https://github.com/xtls/reality) (the REALITY handshake on the
+server). A program that uses only the `miu` library package with the standard library's TLS links neither of them.
 
-## 本机试一下
+## Try it locally
 
 ```sh
-# 一个 PSK(任意字符串,至少 16 个字符;两端必须逐字符相同)
+# A PSK (any string of at least 16 characters; both ends must use exactly the same characters)
 openssl rand -base64 32
 
-# 一张自签证书(只为试用;正式使用请换成受信任的证书)
+# A self-signed certificate (for trying it out only; use a trusted certificate in production)
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 365 \
   -keyout key.pem -out cert.pem -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com"
 ```
@@ -55,30 +65,30 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 365 \
   "listen": "127.0.0.1:8443",
   "cert": "cert.pem",
   "key": "key.pem",
-  "users": [{"name": "alice", "psk": "<上面生成的 PSK>"}]
+  "users": [{"name": "alice", "psk": "<the PSK generated above>"}]
 }
 ```
 
 ```sh
 bin/miu-server -c server.json
-# 另开一个终端(自签证书,所以要 -insecure)
-bin/miu-client -server 127.0.0.1:8443 -sni example.com -psk '<上面生成的 PSK>' -insecure
-# 再开一个终端
+# In another terminal (the certificate is self-signed, hence -insecure)
+bin/miu-client -server 127.0.0.1:8443 -sni example.com -psk '<the PSK generated above>' -insecure
+# In a third terminal
 curl -x socks5h://127.0.0.1:1080 https://example.com/
 ```
 
-服务端每开一条流打印一行访问日志:`用户名 客户端地址 -> tcp|udp 目标`。
+The server prints one access-log line per stream: `user client-address -> tcp|udp target`.
 
-## 服务端
+## Server
 
 ```sh
-miu-server -c server.json [-listen 地址] [-v]
-miu-server keygen            # 生成一对 REALITY 密钥
+miu-server -c server.json [-listen address] [-v]
+miu-server keygen            # generate a REALITY key pair
 ```
 
-外层二选一:证书(TLS 1.3)或 `reality`。示例见 [examples/](examples/)。
+The outer layer is one of: a certificate (TLS 1.3) or `reality`. Examples are in [examples/](examples/).
 
-外层 TLS 1.3:
+Outer TLS 1.3:
 
 ```json
 {
@@ -93,7 +103,7 @@ miu-server keygen            # 生成一对 REALITY 密钥
 }
 ```
 
-外层 REALITY:
+Outer REALITY:
 
 ```json
 {
@@ -101,43 +111,55 @@ miu-server keygen            # 生成一对 REALITY 密钥
   "reality": {
     "dest": "www.example.com:443",
     "serverNames": ["www.example.com"],
-    "privateKey": "<miu-server keygen 输出的 privateKey>",
+    "privateKey": "<privateKey printed by miu-server keygen>",
     "shortIds": ["0123456789abcdef"]
   },
   "users": [{"name": "alice", "psk": "..."}]
 }
 ```
 
-| 字段 | 说明 |
+| Field | Meaning |
 |---|---|
-| `listen` | 监听地址,默认 `:443`;命令行 `-listen` 覆盖 |
-| `cert` / `key` | 外层 TLS 的证书与私钥(PEM 文件)。只接受 TLS 1.3 |
-| `reality.dest` | 伪装目标 `host:port`,必须支持 TLS 1.3。没通过认证的连接原样转发给它 |
-| `reality.serverNames` | 客户端可以用的 SNI,应当是伪装目标证书覆盖的名字 |
-| `reality.privateKey` | X25519 私钥,base64url 无填充 |
-| `reality.shortIds` | 客户端可以出示的 short id,每个是最多 16 位十六进制;可以包含空串 `""` |
-| `users` | 用户列表:`name` 只用于日志,`psk` 是凭据(至少 16 个字符,按字符串原样使用,不做 base64 解码) |
-| `idleTimeout` | 没有流的通道保留多少秒,默认 180。会下发给客户端 |
-| `paddingScheme` | 可选,覆盖内建的包长整形方案,每行一个数组元素,如 `["stop=8", "0=30-30", "1=100-400"]` |
+| `listen` | Listen address, `:443` by default; overridden by `-listen` on the command line |
+| `cert` / `key` | Certificate and private key of the outer TLS (PEM files). Only TLS 1.3 is accepted |
+| `reality.dest` | The cover target, `host:port`. It must support TLS 1.3. Connections that fail authentication are forwarded to it unchanged |
+| `reality.serverNames` | SNI values the client may use; they should be names covered by the cover target's certificate |
+| `reality.privateKey` | X25519 private key, base64url without padding |
+| `reality.shortIds` | Short ids the client may present, each up to 16 hex digits; the empty string `""` is allowed |
+| `users` | User list: `name` is used in logs only, `psk` is the credential (at least 16 characters, used as the string it is, not base64-decoded) |
+| `idleTimeout` | How many seconds a lane without a stream is kept, 180 by default. Sent to the client |
+| `paddingScheme` | Optional; overrides the built-in packet-length shaping scheme, one array element per line, e.g. `["stop=8", "0=30-30", "1=100-400"]` |
 
-`-v` 额外打印诊断信息(目标连不上、握手失败、认证失败)。
+`-v` additionally prints diagnostics (target unreachable, handshake failure, authentication failure) and, when a stream
+ends, one line with how many bytes it carried and how many of them went as raw segments:
 
-REALITY 服务端启动后会先探测一次伪装目标(握手之后它还会发些什么,以便照着发),大约需要 5 秒;这期间到达的连接会等它。
+```
+alice 198.51.100.7:53124 -> tcp example.org:443 closed: up 496 (raw 0), down 8401247 (raw 8397151)
+```
 
-不是每个站点都能当伪装目标:个别站点在 REALITY 库照着它握手时会失败(与 miu 无关,同一目标换成别的基于该库的协议一样连不上)。
-换目标之后先用 `miu-client` 实际连一次确认。
+A non-zero `raw` means the sender of that direction recognised the inner TLS 1.3 and the receiver can take raw
+segments. When you are bringing up another client implementation, this is the most direct way to confirm that raw
+segments work.
 
-## 客户端
+After it starts, a REALITY server first probes the cover target once (to learn what it sends after the handshake, so
+it can send the same). This takes about 5 seconds, and connections that arrive in the meantime wait for it.
+
+Not every site works as a cover target: with a few sites the handshake fails when the REALITY library imitates them
+(this is unrelated to miu; other protocols built on the same library fail with the same target). After changing the
+target, connect once with `miu-client` to make sure it works.
+
+## Client
 
 ```sh
 miu-client -c client.json [-v]
-miu-client -server example.com:443 -psk '...' [-sni 名字] [-insecure] [-fingerprint chrome] [-listen 127.0.0.1:1080]
-miu-client keygen            # 同 miu-server keygen
+miu-client -server example.com:443 -psk '...' [-sni name] [-insecure] [-fingerprint chrome] [-listen 127.0.0.1:1080]
+miu-client keygen            # same as miu-server keygen
 ```
 
-本地开一个 SOCKS5 代理(无认证;支持 CONNECT 与 UDP ASSOCIATE),默认 `127.0.0.1:1080`。命令行参数覆盖配置文件里的同名项。
+It opens a local SOCKS5 proxy (no authentication; CONNECT and UDP ASSOCIATE are supported), `127.0.0.1:1080` by
+default. Command-line flags override the same settings in the configuration file.
 
-外层 TLS 1.3:
+Outer TLS 1.3:
 
 ```json
 {
@@ -150,7 +172,7 @@ miu-client keygen            # 同 miu-server keygen
 }
 ```
 
-外层 REALITY:
+Outer REALITY:
 
 ```json
 {
@@ -159,33 +181,34 @@ miu-client keygen            # 同 miu-server keygen
   "psk": "...",
   "reality": {
     "serverName": "www.example.com",
-    "publicKey": "<miu-server keygen 输出的 publicKey>",
+    "publicKey": "<publicKey printed by miu-server keygen>",
     "shortId": "0123456789abcdef"
   }
 }
 ```
 
-| 字段 | 说明 |
+| Field | Meaning |
 |---|---|
-| `listen` | 本地 SOCKS5 地址,默认 `127.0.0.1:1080` |
-| `server` | 服务端地址 `host:port` |
-| `psk` | 与服务端某个用户相同的字符串 |
-| `sni` | 外层 TLS 的 SNI,默认取 `server` 的主机名 |
-| `insecure` | `true` 时不校验服务端证书(只应在试用自签证书时打开) |
-| `fingerprint` | `"chrome"`:ClientHello 换成 Chrome 的(uTLS);不写则是 Go 标准库的 |
-| `reality.serverName` | SNI,必须是服务端 `serverNames` 里的一个(不写则取 `sni`) |
-| `reality.publicKey` | 服务端的 X25519 公钥,base64url 无填充 |
-| `reality.shortId` | 服务端 `shortIds` 里的一个,可以是空串 |
+| `listen` | Local SOCKS5 address, `127.0.0.1:1080` by default |
+| `server` | Server address, `host:port` |
+| `psk` | The same string as one of the server's users |
+| `sni` | SNI of the outer TLS; defaults to the host name in `server` |
+| `insecure` | `true` skips verification of the server certificate (only for trying out a self-signed certificate) |
+| `fingerprint` | `"chrome"`: use Chrome's ClientHello (uTLS); if omitted, the Go standard library's |
+| `reality.serverName` | SNI; must be one of the server's `serverNames` (defaults to `sni`) |
+| `reality.publicKey` | The server's X25519 public key, base64url without padding |
+| `reality.shortId` | One of the server's `shortIds`; may be the empty string |
 
-用了 `reality` 时 ClientHello 固定是 Chrome 的,`insecure` 不适用:服务端的身份由握手里的认证确定,
-认证不过(公钥、short id 或 SNI 不对)握手直接失败。
+With `reality` the ClientHello is always Chrome's and `insecure` does not apply: the server's identity is established
+by the authentication inside the handshake, and the handshake simply fails when that authentication does not pass
+(wrong public key, short id or SNI).
 
-## 作为库使用
+## Using it as a library
 
 ```go
 import "github.com/MiuProtocol/Miu/miu"
 
-// 服务端:自己监听、做完外层握手,把连接交给 Serve。
+// Server: listen and complete the outer handshake yourself, then hand the connection to Serve.
 srv, err := miu.NewServer(miu.ServerConfig{
 	Users:    []miu.User{{Name: "alice", PSK: psk}},
 	OnAccess: func(a miu.Access) { log.Printf("%s -> %s %s", a.User, a.Network, a.Target) },
@@ -197,61 +220,75 @@ for {
 	go srv.Serve(ctx, conn)
 }
 
-// 客户端:一个 Client 就是到一台服务端的通道池。
+// Client: one Client is the lane pool to one server.
 client, err := miu.NewClient(miu.ClientConfig{
 	PSK:  psk,
 	Dial: miu.TLSDialer("example.com:443", &tls.Config{}),
 })
-conn, err := client.DialContext(ctx, "tcp", "example.org:443") // net.Conn,另有 CloseWrite
-pc, err := client.ListenPacket()                               // net.PacketConn(UDP)
+conn, err := client.DialContext(ctx, "tcp", "example.org:443") // net.Conn, plus CloseWrite
+pc, err := client.ListenPacket()                               // net.PacketConn (UDP)
 ```
 
-- `conn.Close()` 在两个方向都结束之前调用就是中止(发 RESET),通道仍然回池;`CloseWrite()` 是半关闭。
-- 外层换成别的:`miu/fingerprint`(`fingerprint.Dialer`,uTLS)、`miu/reality`(`reality.Dialer`)提供另外两种 `Dial`;
-  服务端的 REALITY 握手在 `miu/realityserver`。任何 `net.Conn` 都可以当外层,但只有直接架在 TCP 上的 Go TLS 连接
-  (crypto/tls、uTLS、xtls/reality)才有裸段。
-- 裸段要用反射取 Go TLS 连接的两个内部缓冲。`miu.SelfTest`(以及 `fingerprint.SelfTest`、`realityserver.SelfTest`)
-  在内存里实际跑一遍来确认这在当前的 Go 版本上可用;两个命令行程序启动时都会跑,不通过就打印错误并关掉裸段
-  (settings 里声明 `raw=0`),其余功能不受影响。自己写程序时建议照做,失败时设 `DisableRaw`。
-- 网络切换之后调 `client.CloseIdle()` 把池清掉。
+- Calling `conn.Close()` before both directions have ended aborts the stream (sends RESET); the lane still goes back to
+  the pool. `CloseWrite()` is a half-close.
+- Other outer layers: `miu/fingerprint` (`fingerprint.Dialer`, uTLS) and `miu/reality` (`reality.Dialer`) provide two
+  more `Dial` functions; the server side of the REALITY handshake is in `miu/realityserver`. Any `net.Conn` can serve as
+  the outer layer, but only a Go TLS connection sitting directly on TCP (crypto/tls, uTLS, xtls/reality) gets raw
+  segments.
+- Raw segments need two internal buffers of the Go TLS connection, reached by reflection. `miu.SelfTest` (and
+  `fingerprint.SelfTest`, `realityserver.SelfTest`) actually runs an exchange in memory to confirm this works with the
+  current Go version. Both command-line programs run it at startup; if it fails they print an error and turn raw
+  segments off (declaring `raw=0` in settings), and everything else keeps working. Do the same in your own program and
+  set `DisableRaw` on failure.
+- After a network change, call `client.CloseIdle()` to empty the pool.
+- On the server, `ServerConfig.OnAccess` is called when a stream starts and `OnClose` when it ends, with a `Traffic`
+  value (bytes in each direction and how many of them were raw segments).
+- The core package `miu` uses only the standard library, and only Go 1.20 syntax and APIs. If the host project's Go
+  version is lower than what this module's `go.mod` requires, copy the non-test files of the `miu/` directory into it
+  as they are (keep the LICENSE).
 
-## 目前支持
+For the complete steps to add a Miu outbound to mihomo (or one of its forks), see [docs/mihomo.md](docs/mihomo.md).
+That document is written for an AI coding assistant to follow.
 
-- TCP;UDP(UoT v2,服务端每个会话一个 UDP socket,full-cone)
-- 外层 TLS 1.3(标准库,或 Chrome 指纹)与 REALITY(客户端 Chrome 指纹)
-- 裸段(两个方向),Linux 上服务端下行走 splice + TCP_CORK,其它平台走用户态拷贝
-- 通道池:后进先出、分两档保留、连续开流时预热、取用前探活、死通道重放
-- 包长整形与服务端下发方案;RESET 中止;半关闭
-- 多用户;访问日志
+## Supported
 
-## 目前不支持
+- TCP; UDP (UoT v2, one UDP socket per session on the server, full-cone)
+- Outer TLS 1.3 (standard library, or Chrome fingerprint) and REALITY (Chrome fingerprint on the client)
+- Raw segments in both directions; on Linux the server's downlink uses splice + TCP_CORK, other platforms copy in user space
+- Lane pool: last in first out, two retention tiers, pre-warming while streams are being opened in quick succession, a liveness check before use, replay on a dead lane
+- Packet-length shaping, with the scheme pushed by the server; RESET abort; half-close
+- Multiple users; access log
 
-- 多路复用、心跳、会话恢复:协议里就没有
-- 外层为 WebSocket / gRPC,或经反向代理终结 TLS(库可以接受任何 `net.Conn` 当外层,只是没有裸段;两个程序没有做这些传输)
-- 客户端指纹只有 `chrome`
-- REALITY 的附加项:ML-DSA-65 验证、PROXY protocol(`xver`)、客户端版本与时间差限制
-- SOCKS5 的用户名密码认证、BIND、UDP 分片;HTTP 代理入站;透明代理 / TUN
-- 服务端的路由与出站策略、流量统计、限速、运行中增删用户(目标一律由服务端直接拨出;库里可以用 `ServerConfig.Dial` 换掉拨号)
-- Windows 上「取用前探活」没有实现,死通道靠重放兜底
+## Not supported
 
-## 测试
+- Multiplexing, heartbeats, session resumption: the protocol does not have them
+- WebSocket / gRPC as the outer layer, or TLS terminated by a reverse proxy (the library accepts any `net.Conn` as the outer layer, only without raw segments; the two programs do not implement these transports)
+- Client fingerprints other than `chrome`
+- REALITY extras: ML-DSA-65 verification, PROXY protocol (`xver`), limits on client version and clock difference
+- SOCKS5 username/password authentication, BIND, UDP fragmentation; an HTTP proxy inbound; transparent proxy / TUN
+- Routing and outbound policy on the server, traffic statistics, rate limiting, adding or removing users at run time (the server always dials the target directly; in the library the dialing can be replaced with `ServerConfig.Dial`)
+- The liveness check before use is not implemented on Windows; dead lanes are covered by replay
+
+## Tests
 
 ```sh
 go test -race ./...
 ```
 
-回环测试覆盖四种外层(明文、TLS、uTLS、REALITY)下的小包、大包、并发、内层真实 TLS 1.3(断言两个方向都走了裸段)、
-UDP、中止后通道复用、死通道重放等。`miu/live_test.go` 里另有两项对着别的实现跑的互通测试,由环境变量开启,说明在文件开头。
+The loopback tests cover small and large payloads, concurrency, a real inner TLS 1.3 (asserting that both directions
+used raw segments), UDP, lane reuse after an abort, replay on a dead lane and more, under four outer layers
+(plaintext, TLS, uTLS, REALITY). `miu/live_test.go` additionally holds two interoperability tests that run against
+another implementation; they are enabled by environment variables described at the top of the file.
 
-## 标志
+## Logo
 
-标志是一个带猫耳的 μ(读作 miu)。[assets/](assets/) 里有两份:
+The logo is a μ (read "miu") with cat ears. [assets/](assets/) holds two versions:
 
-| 文件 | 用途 |
+| File | Use |
 |---|---|
-| [miu-logo.svg](assets/miu-logo.svg) | 橙底圆角方形图标,用作应用图标、头像 |
-| [miu-mark.svg](assets/miu-mark.svg) | 单色标记,颜色跟随 `currentColor`,用在协议徽标、列表里的小图标 |
+| [miu-logo.svg](assets/miu-logo.svg) | Rounded square icon on orange, for app icons and avatars |
+| [miu-mark.svg](assets/miu-mark.svg) | Single-colour mark that follows `currentColor`, for protocol badges and small icons in lists |
 
-## 许可证
+## License
 
-[MIT](LICENSE)。
+[MIT](LICENSE).
