@@ -248,7 +248,8 @@ pc, err := client.ListenPacket()                               // net.PacketConn
   as they are (keep the LICENSE).
 
 For the complete steps to add a Miu outbound to mihomo (or one of its forks), see [docs/mihomo.md](docs/mihomo.md).
-That document is written for an AI coding assistant to follow.
+That document is written for an AI coding assistant to follow. A fork of mihomo with those steps already applied is at
+[MiuProtocol/mihomo](https://github.com/MiuProtocol/mihomo) (branch `Alpha`).
 
 ## Supported
 

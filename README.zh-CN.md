@@ -227,6 +227,7 @@ pc, err := client.ListenPacket()                               // net.PacketConn
   可以把 `miu/` 目录下的非测试文件原样拷进去用(保留 LICENSE)。
 
 把 Miu 出站接进 mihomo(或它的分支)的完整步骤见 [docs/mihomo.zh-CN.md](docs/mihomo.zh-CN.md),那份文档是写给 AI 编码助手照着做的。
+已经照这份文档接好的 mihomo 在 [MiuProtocol/mihomo](https://github.com/MiuProtocol/mihomo)(`Alpha` 分支)。
 
 ## 目前支持
 
