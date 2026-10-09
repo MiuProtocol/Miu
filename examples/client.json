@@ -1,0 +1,8 @@
+{
+  "listen": "127.0.0.1:1080",
+  "server": "example.com:443",
+  "sni": "example.com",
+  "psk": "REPLACE-WITH-OUTPUT-OF-openssl-rand-base64-32",
+  "insecure": false,
+  "fingerprint": "chrome"
+}

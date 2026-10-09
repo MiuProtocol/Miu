@@ -1,0 +1,11 @@
+# build output
+/bin/
+/miu-server
+/miu-client
+*.exe
+*.test
+*.out
+
+# local configuration and keys
+/*.json
+*.pem

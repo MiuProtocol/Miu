@@ -1,0 +1,10 @@
+{
+  "listen": "127.0.0.1:1080",
+  "server": "203.0.113.10:443",
+  "psk": "REPLACE-WITH-OUTPUT-OF-openssl-rand-base64-32",
+  "reality": {
+    "serverName": "www.example.com",
+    "publicKey": "REPLACE-WITH-publicKey-FROM-miu-server-keygen",
+    "shortId": "0123456789abcdef"
+  }
+}

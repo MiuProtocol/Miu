@@ -1,0 +1,12 @@
+{
+  "listen": ":443",
+  "reality": {
+    "dest": "www.example.com:443",
+    "serverNames": ["www.example.com"],
+    "privateKey": "REPLACE-WITH-privateKey-FROM-miu-server-keygen",
+    "shortIds": ["0123456789abcdef"]
+  },
+  "users": [
+    {"name": "alice", "psk": "REPLACE-WITH-OUTPUT-OF-openssl-rand-base64-32"}
+  ]
+}

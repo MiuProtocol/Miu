@@ -1,0 +1,10 @@
+{
+  "listen": ":443",
+  "cert": "/etc/miu/cert.pem",
+  "key": "/etc/miu/key.pem",
+  "users": [
+    {"name": "alice", "psk": "REPLACE-WITH-OUTPUT-OF-openssl-rand-base64-32"},
+    {"name": "bob", "psk": "REPLACE-WITH-ANOTHER-RANDOM-STRING-0123456789"}
+  ],
+  "idleTimeout": 180
+}
