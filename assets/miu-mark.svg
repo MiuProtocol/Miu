@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="120 90 272 332" role="img" aria-label="Miu">
+  <title>Miu</title>
+  <g transform="translate(-13 -14)" fill="none" stroke="currentColor" stroke-width="40" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M196 204V400"/>
+    <path d="M196 204V296a60 60 0 0 0 120 0V204"/>
+    <path d="M316 296q0 52 44 52"/>
+    <path d="M182 204L182 134L210 204Z" fill="currentColor" stroke-width="12"/>
+    <path d="M330 204L330 134L302 204Z" fill="currentColor" stroke-width="12"/>
+  </g>
+</svg>

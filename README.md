@@ -1,7 +1,14 @@
-# miu
+<p align="center">
+  <img src="assets/miu-logo.svg" width="112" alt="Miu">
+</p>
 
-miu 是一个跑在 TLS 1.3 / REALITY 之上的代理协议:**连接池代替多路复用,内层已经是 TLS 1.3 密文的数据不再加密第二遍**。
-本仓库是它的独立 Go 实现:一个库、一个服务端程序 `miu-server`、一个客户端程序 `miu-client`(本地 SOCKS5)。
+<h1 align="center">Miu</h1>
+
+<p align="center">
+  跑在 TLS 1.3 / REALITY 之上的代理协议:连接池代替多路复用,内层已经是 TLS 1.3 密文的数据不再加密第二遍。
+</p>
+
+本仓库是 Miu 的独立 Go 实现:一个库、一个服务端程序 `miu-server`、一个客户端程序 `miu-client`(本地 SOCKS5)。
 
 线上格式与行为要求见 [PROTOCOL.md](PROTOCOL.md)。
 
@@ -235,6 +242,15 @@ go test -race ./...
 
 回环测试覆盖四种外层(明文、TLS、uTLS、REALITY)下的小包、大包、并发、内层真实 TLS 1.3(断言两个方向都走了裸段)、
 UDP、中止后通道复用、死通道重放等。`miu/live_test.go` 里另有两项对着别的实现跑的互通测试,由环境变量开启,说明在文件开头。
+
+## 标志
+
+标志是一个带猫耳的 μ(读作 miu)。[assets/](assets/) 里有两份:
+
+| 文件 | 用途 |
+|---|---|
+| [miu-logo.svg](assets/miu-logo.svg) | 橙底圆角方形图标,用作应用图标、头像 |
+| [miu-mark.svg](assets/miu-mark.svg) | 单色标记,颜色跟随 `currentColor`,用在协议徽标、列表里的小图标 |
 
 ## 许可证
 
