@@ -2,6 +2,8 @@ module github.com/MiuProtocol/Miu
 
 go 1.24.0
 
+toolchain go1.27.3
+
 require (
 	github.com/refraction-networking/utls v1.8.2
 	github.com/xtls/reality v0.0.0-20260322125925-9234c772ba8f

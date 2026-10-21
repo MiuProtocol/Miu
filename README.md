@@ -34,7 +34,10 @@ The wire format and the required behaviour are specified in [PROTOCOL.md](PROTOC
 
 ## Build
 
-Go 1.24 or newer is required.
+Go 1.24 or newer is required. Build the programs with Go 1.26.10 / 1.27.3 or newer: older Go releases still accept
+certificates issued by intermediate CAs that are no longer trusted (CVE-2026-111943), and the TLS outer layer verifies
+the server certificate with Go's `crypto/x509` (REALITY does not use CA verification). `go.mod` names go1.27.3 as the
+toolchain, so with the default `GOTOOLCHAIN=auto` the go command downloads it when the installed one is older.
 
 ```sh
 go build -o bin/ ./cmd/...
@@ -241,6 +244,9 @@ pc, err := client.ListenPacket()                               // net.PacketConn
   segments off (declaring `raw=0` in settings), and everything else keeps working. Do the same in your own program and
   set `DisableRaw` on failure.
 - After a network change, call `client.CloseIdle()` to empty the pool.
+- The TLS outer layer verifies the server certificate with the host program's `crypto/x509`, so build the host with
+  Go 1.26.10 / 1.27.3 or newer (CVE-2026-111943). The `toolchain` line in this module's `go.mod` does not apply to
+  programs that import it.
 - On the server, `ServerConfig.OnAccess` is called when a stream starts and `OnClose` when it ends, with a `Traffic`
   value (bytes in each direction and how many of them were raw segments).
 - The core package `miu` uses only the standard library, and only Go 1.20 syntax and APIs. If the host project's Go

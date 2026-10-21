@@ -28,7 +28,9 @@
 
 ## 构建
 
-需要 Go 1.24 或更新的版本。
+需要 Go 1.24 或更新的版本。编译程序请用 Go 1.26.10 / 1.27.3 或更新的版本:更早的 Go 仍会接受已经不再受信任的中间 CA
+签发的证书(CVE-2026-111943),而 TLS 外层用 Go 的 `crypto/x509` 校验服务端证书(REALITY 不走 CA 校验)。`go.mod` 里把
+工具链定为 go1.27.3,缺省的 `GOTOOLCHAIN=auto` 下本机版本更旧时 go 命令会自动下载它。
 
 ```sh
 go build -o bin/ ./cmd/...
@@ -222,6 +224,8 @@ pc, err := client.ListenPacket()                               // net.PacketConn
   在内存里实际跑一遍来确认这在当前的 Go 版本上可用;两个命令行程序启动时都会跑,不通过就打印错误并关掉裸段
   (settings 里声明 `raw=0`),其余功能不受影响。自己写程序时建议照做,失败时设 `DisableRaw`。
 - 网络切换之后调 `client.CloseIdle()` 把池清掉。
+- TLS 外层用宿主程序的 `crypto/x509` 校验服务端证书,宿主请用 Go 1.26.10 / 1.27.3 或更新的版本编译(CVE-2026-111943)。
+  本模块 `go.mod` 里的 `toolchain` 一行对引用它的程序不起作用。
 - 服务端的 `ServerConfig.OnAccess` 在每条流开始时回调,`OnClose` 在结束时回调并带上 `Traffic`(两个方向的字节数与其中走裸段的部分)。
 - 核心包 `miu` 只用标准库,并且只用到 Go 1.20 的语法与标准库:宿主工程的 Go 版本低于本模块 `go.mod` 的要求时,
   可以把 `miu/` 目录下的非测试文件原样拷进去用(保留 LICENSE)。
