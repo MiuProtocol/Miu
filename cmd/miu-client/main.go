@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/MiuProtocol/Miu/miu"
@@ -28,6 +29,8 @@ type config struct {
 	// Server is the miu server, host:port.
 	Server string `json:"server"`
 	PSK    string `json:"psk"`
+	// PaddingScheme overrides the PSK-derived initial scheme when non-empty.
+	PaddingScheme []string `json:"paddingScheme"`
 	// SNI is the server name of the outer TLS handshake; the host of Server when empty.
 	SNI string `json:"sni"`
 	// Insecure skips the verification of the server's certificate.
@@ -123,7 +126,7 @@ func run(cfg config, verbose bool) error {
 	if _, _, err := net.SplitHostPort(cfg.Server); err != nil {
 		return fmt.Errorf("server: %w", err)
 	}
-	ccfg := miu.ClientConfig{PSK: cfg.PSK}
+	ccfg := miu.ClientConfig{PSK: cfg.PSK, PaddingScheme: strings.Join(cfg.PaddingScheme, "\n")}
 	tlsCfg := &tls.Config{ServerName: cfg.SNI, InsecureSkipVerify: cfg.Insecure}
 
 	// Raw segments reach into the TLS connection. Make sure that works with the TLS stack in use, and

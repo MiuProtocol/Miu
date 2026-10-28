@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -39,6 +40,8 @@ var ErrClientClosed = errors.New("miu: client closed")
 type ClientConfig struct {
 	// PSK is the pre-shared key, used as a string exactly as the server has it.
 	PSK string
+	// PaddingScheme overrides the PSK-derived initial scheme when non-empty.
+	PaddingScheme string
 	// Dial opens a connection to the server and completes the outer TLS handshake on it. Raw segments
 	// are available when the result is a *crypto/tls.Conn (or a uTLS connection) sitting directly on
 	// the TCP connection. See TLSDialer.
@@ -55,6 +58,9 @@ type ClientConfig struct {
 type Client struct {
 	cfg   ClientConfig
 	token [32]byte
+
+	paddingMu sync.RWMutex
+	padding   *paddingScheme
 
 	mu       sync.Mutex
 	idle     []idleLane
@@ -85,7 +91,17 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.MinIdle <= 0 {
 		cfg.MinIdle = defaultMinIdle
 	}
-	return &Client{cfg: cfg, token: token}, nil
+	padding, err := derivePaddingScheme(token)
+	if err != nil {
+		return nil, fmt.Errorf("miu: failed to derive padding scheme: %w", err)
+	}
+	if cfg.PaddingScheme != "" {
+		padding = parsePaddingScheme(cfg.PaddingScheme)
+		if padding == nil {
+			return nil, errors.New("miu: bad padding scheme")
+		}
+	}
+	return &Client{cfg: cfg, token: token, padding: padding}, nil
 }
 
 // TLSDialer returns a ClientConfig.Dial that connects to address over TCP and performs a TLS handshake
@@ -109,6 +125,25 @@ func TLSDialer(address string, cfg *tls.Config) func(ctx context.Context) (net.C
 
 // ---- the lane pool ----
 
+func (c *Client) currentPadding() *paddingScheme {
+	c.paddingMu.RLock()
+	p := c.padding
+	c.paddingMu.RUnlock()
+	if p == nil {
+		return defaultScheme
+	}
+	return p
+}
+
+func (c *Client) updatePadding(p *paddingScheme) {
+	if p == nil {
+		return
+	}
+	c.paddingMu.Lock()
+	c.padding = p
+	c.paddingMu.Unlock()
+}
+
 // dial opens a new lane: the outer handshake, then the authentication header, its padding and Settings
 // in a single write. Nothing is waited for.
 func (c *Client) dial(ctx context.Context) (*lane, error) {
@@ -117,6 +152,8 @@ func (c *Client) dial(ctx context.Context) (*lane, error) {
 		return nil, err
 	}
 	l := newLane(conn, false, !c.cfg.DisableRaw)
+	l.client = c
+	l.scheme.Store(c.currentPadding())
 	scheme := l.scheme.Load()
 	padlen := scheme.padding0()
 	hello := append(make([]byte, 0, authHead+int(padlen)+64), c.token[:]...)

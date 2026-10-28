@@ -163,6 +163,13 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	return s, nil
 }
 
+func (s *Server) schemeForToken(token [32]byte) (*paddingScheme, error) {
+	if s.cfg.PaddingScheme != "" {
+		return s.scheme, nil
+	}
+	return derivePaddingScheme(token)
+}
+
 func (s *Server) logf(format string, args ...any) {
 	if s.cfg.Logf != nil {
 		s.cfg.Logf(format, args...)
@@ -194,7 +201,11 @@ func (s *Server) Serve(ctx context.Context, conn net.Conn) error {
 	}
 
 	l := newLane(conn, true, !s.cfg.DisableRaw)
-	l.scheme.Store(s.scheme)
+	laneScheme, err := s.schemeForToken([32]byte(h[:32]))
+	if err != nil {
+		return err
+	}
+	l.scheme.Store(laneScheme)
 	// Close the lane when ctx is done.
 	go func() {
 		select {
@@ -311,8 +322,9 @@ func (s *Server) handleSettings(l *lane, text string) error {
 	kv := parseKV(text)
 	l.peerRaw.Store(kv["raw"] == "1")
 	reply := appendFrame(nil, frServerSettings, l.settingsText(fmt.Sprintf("\nidle=%d", int(s.cfg.IdleTimeout/time.Second))))
-	if md5 := strings.ToLower(strings.TrimSpace(kv["padding-md5"])); md5 != "" && md5 != s.scheme.md5 {
-		reply = appendFrame(reply, frUpdatePadding, s.scheme.raw)
+	scheme := l.scheme.Load()
+	if md5 := strings.ToLower(strings.TrimSpace(kv["padding-md5"])); md5 != "" && md5 != scheme.md5 {
+		reply = appendFrame(reply, frUpdatePadding, scheme.raw)
 	}
 	return l.writeUnshaped(reply)
 }
