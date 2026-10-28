@@ -28,6 +28,7 @@ type lane struct {
 	canRaw  bool
 	peerRaw atomic.Bool
 	server  bool
+	client  *Client
 
 	wmu    sync.Mutex
 	scheme atomic.Pointer[paddingScheme]
@@ -208,6 +209,9 @@ func (l *lane) control(typ byte, payload []byte) error {
 	case frUpdatePadding:
 		if s := parsePaddingScheme(string(payload)); s != nil {
 			l.scheme.Store(s)
+			if l.client != nil {
+				l.client.updatePadding(s)
+			}
 		}
 	default:
 		return fmt.Errorf("miu: unexpected frame type %d", typ)
