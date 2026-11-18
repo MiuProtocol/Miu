@@ -393,9 +393,25 @@ func (l *lane) writePacketLocked(pkt uint32, p []byte) error {
 // frame of its record, padded in front like any small record (it would otherwise always be the same few
 // dozen bytes long, before every segment). n raw bytes follow. Caller holds wmu.
 func (l *lane) writeRawHeader(n int) error {
-	hdr := [frameHead + 4]byte{frRaw, 0, 4}
-	binary.BigEndian.PutUint32(hdr[frameHead:], uint32(n))
-	return l.write(l.padSmall(hdr[:]))
+	return l.writeRawHeaderAfter(nil, n)
+}
+
+// writeRawHeaderAfter writes lead (encoded frames) and the RAW frame for n bytes as one record.
+func (l *lane) writeRawHeaderAfter(lead []byte, n int) error {
+	hdr := append(lead, frRaw, 0, 4, 0, 0, 0, 0)
+	binary.BigEndian.PutUint32(hdr[len(hdr)-4:], uint32(n))
+	return l.write(l.padSmall(hdr))
+}
+
+// firstRecordLen returns the length, header included, of the TLS record at the start of a followed by
+// b; 0 when the header is not all there.
+func firstRecordLen(a, b []byte) int {
+	var h [5]byte
+	k := copy(h[:], a)
+	if copy(h[k:], b) < 5-k {
+		return 0
+	}
+	return 5 + int(binary.BigEndian.Uint16(h[3:]))
 }
 
 // writeRaw sends p as raw segments: a record with the RAW frame, then the bytes straight to the socket.
@@ -411,15 +427,33 @@ func (l *lane) writeRaw(p []byte) error {
 	return nil
 }
 
+// maxPlain is the most plaintext one TLS record carries.
+const maxPlain = 16384
+
 // writeRawRecords sends a followed by b as one raw segment. Callers pass whole inner TLS records, at
 // most maxSeg bytes in all.
+//
+// When the first of those records fits, it goes inside the record that announces the segment, as DATA
+// in front of the RAW frame: the announcement is then not a small record of its own ahead of every
+// segment, but a record about as long as an inner one. A full-size inner record does not fit; then the
+// announcement stands alone (padded like any small record).
 func (l *lane) writeRawRecords(a, b []byte) error {
 	l.wmu.Lock()
 	defer l.wmu.Unlock()
-	// Cork the socket between the RAW frame and its data, so that the small record does not travel in a
+	var lead []byte
+	if first := firstRecordLen(a, b); first > 0 && first < len(a)+len(b) &&
+		len(l.prefix)+frameHead+first+frameHead+4 <= maxPlain {
+		rec := make([]byte, 0, first)
+		k := minInt(first, len(a))
+		rec = append(append(rec, a[:k]...), b[:first-k]...)
+		a, b = a[k:], b[first-k:]
+		lead = appendFrame(make([]byte, 0, frameHead+first+frameHead+4), frData, rec)
+		l.event("rawlead")
+	}
+	// Cork the socket between the RAW frame and its data, so that the announcement does not travel in a
 	// packet of its own.
 	setCork(l.sock, true)
-	err := l.writeRawHeader(len(a) + len(b))
+	err := l.writeRawHeaderAfter(lead, len(a)+len(b))
 	if err == nil {
 		switch {
 		case len(a) == 0:

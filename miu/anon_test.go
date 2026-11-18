@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"strings"
@@ -142,5 +143,45 @@ func TestServerComparesWithBase(t *testing.T) {
 	}
 	if f := withoutPad(frameTypes(rc.first())); !bytes.Equal(f, []byte{frServerSettings}) {
 		t.Fatalf("frames %v, want ServerSettings alone", f)
+	}
+}
+
+// The first inner record of a raw segment rides in the announcing record when it fits (DATA, then the
+// RAW frame for the rest, last); a full-size one does not, and the announcement stands alone.
+func TestRawSegmentCarriesFirstRecord(t *testing.T) {
+	rec := func(n int) []byte {
+		return append([]byte{0x17, 3, 3, byte(n >> 8), byte(n)}, bytes.Repeat([]byte{byte(n)}, n)...)
+	}
+	for _, tc := range []struct {
+		first int
+		carry bool
+	}{{120, true}, {4000, true}, {16384 - 40, true}, {16380, false}, {16401, false}} {
+		l, peer := pipeLane(t)
+		a := rec(tc.first)
+		b := append(rec(16401), rec(300)...)
+		w := collect(t, l, peer, func() error { return l.writeRawRecords(a, b) })
+		head := w[0]
+		types := withoutPad(frameTypes(head))
+		if tc.carry {
+			if !bytes.Equal(types, []byte{frData, frRaw}) {
+				t.Fatalf("first %d: announcing record frames %v, want DATA RAW", tc.first, types)
+			}
+			if got := stripPad([][]byte{head[:len(head)-frameHead-4]}); !bytes.Equal(got, appendFrame(nil, frData, a)) {
+				t.Fatalf("first %d: the carried record changed", tc.first)
+			}
+			if !bytes.Equal(bytes.Join(w[1:], nil), b) {
+				t.Fatalf("first %d: the raw bytes are not the rest", tc.first)
+			}
+		} else {
+			if !bytes.Equal(types, []byte{frRaw}) {
+				t.Fatalf("first %d: announcing record frames %v, want RAW alone", tc.first, types)
+			}
+			if !bytes.Equal(bytes.Join(w[1:], nil), append(append([]byte(nil), a...), b...)) {
+				t.Fatalf("first %d: the raw bytes changed", tc.first)
+			}
+		}
+		if n := int(binary.BigEndian.Uint32(head[len(head)-4:])); n != len(bytes.Join(w[1:], nil)) {
+			t.Fatalf("first %d: RAW announces %d bytes", tc.first, n)
+		}
 	}
 }

@@ -138,7 +138,9 @@ inner TLS 1.3 ciphertext records.
   - a record begun in DATA (such as the one the switch to the raw phase happened in) also ends in DATA;
   - if the bytes stop parsing as TLS records, the rest of the direction goes as DATA.
 - The record announcing a segment is padded like any small record (§6), so that announcing records do not all have
-  the same length; the PAD goes in front of the RAW frame. Then the bytes go directly to TCP. Where possible, let the
+  the same length; the PAD goes in front of the RAW frame. When the segment's first inner record fits in that TLS
+  record along with the RAW frame, the sender puts it there, as DATA in front of the RAW frame (which then announces
+  the rest): the announcement is then not a small record of its own ahead of every segment. Then the bytes go directly to TCP. Where possible, let the
   two writes leave together (TCP_CORK on Linux, or a single combined write) so that the small record does not take a
   packet of its own.
 - After reading a RAW frame, the receiver takes exactly N bytes from TCP (first those the TLS layer has already read
