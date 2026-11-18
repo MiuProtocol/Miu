@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -312,35 +313,65 @@ func (l *lane) writePacket(pkt uint32, p []byte) error {
 	return nil
 }
 
-// writeRawHeader writes a record holding nothing but a RAW frame: n raw bytes follow. Caller holds wmu.
+// rawHeaderPadMax bounds the PAD frame put in front of a RAW frame. The record announcing a raw segment
+// would otherwise always be the same few dozen bytes long, before every segment — an easy pattern to
+// match. The range is a placeholder until it is measured against real HTTPS traffic.
+const rawHeaderPadMax = 256
+
+var rawPadZeros [rawHeaderPadMax]byte
+
+// writeRawHeader writes the record announcing a raw segment: a PAD frame of random length (sometimes
+// none), then the RAW frame, which has to be the last frame of its record. n raw bytes follow. Caller
+// holds wmu.
 func (l *lane) writeRawHeader(n int) error {
-	var hdr [frameHead + 4]byte
-	hdr[0], hdr[2] = frRaw, 4
-	binary.BigEndian.PutUint32(hdr[frameHead:], uint32(n))
-	return l.write(hdr[:])
+	var b [frameHead + rawHeaderPadMax + frameHead + 4]byte
+	p := b[:0]
+	if pad := rand.Intn(rawHeaderPadMax + 1); pad >= frameHead {
+		p = appendFrame(p, frPad, rawPadZeros[:pad-frameHead])
+	}
+	p = append(p, frRaw, 0, 4, 0, 0, 0, 0)
+	binary.BigEndian.PutUint32(p[len(p)-4:], uint32(n))
+	return l.write(p)
 }
 
-// writeRaw sends p as raw segments: a record with only a RAW frame, then the bytes straight to the socket.
+// writeRaw sends p as raw segments: a record with the RAW frame, then the bytes straight to the socket.
+// It cuts p every maxSeg bytes regardless of what p holds, so streams use writeRawRecords instead.
 func (l *lane) writeRaw(p []byte) error {
-	l.wmu.Lock()
-	defer l.wmu.Unlock()
 	for len(p) > 0 {
 		seg := p[:minInt(len(p), maxSeg)]
 		p = p[len(seg):]
-		// Cork the socket between the RAW frame and its data, so that the record of a few dozen bytes
-		// does not travel in a packet of its own.
-		setCork(l.sock, true)
-		err := l.writeRawHeader(len(seg))
-		if err == nil {
-			_, err = l.sock.Write(seg)
-		}
-		setCork(l.sock, false)
-		if err != nil {
+		if err := l.writeRawRecords(seg, nil); err != nil {
 			return err
 		}
-		l.event("raw")
 	}
 	return nil
+}
+
+// writeRawRecords sends a followed by b as one raw segment. Callers pass whole inner TLS records, at
+// most maxSeg bytes in all.
+func (l *lane) writeRawRecords(a, b []byte) error {
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+	// Cork the socket between the RAW frame and its data, so that the small record does not travel in a
+	// packet of its own.
+	setCork(l.sock, true)
+	err := l.writeRawHeader(len(a) + len(b))
+	if err == nil {
+		switch {
+		case len(a) == 0:
+			_, err = l.sock.Write(b)
+		case len(b) == 0:
+			_, err = l.sock.Write(a)
+		default:
+			bufs := net.Buffers{a, b} // one writev
+			_, err = bufs.WriteTo(l.sock)
+		}
+	}
+	setCork(l.sock, false)
+	if err == nil {
+		l.event("raw")
+	}
+	return err
 }
 
 // spliceRaw sends the next n bytes of src as one raw segment without bringing them into user space where

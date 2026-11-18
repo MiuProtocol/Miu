@@ -53,8 +53,8 @@ type(1) · len(u16 BE) · payload
 | 7 | END | both | empty. The data of this direction ends here |
 | 8 | RESET | C→S | empty. Abort this stream: the uplink ends here (as with END), and the server is asked to stop the downlink as soon as possible and send END |
 
-- A frame may span TLS records (the receiver parses frames from the byte stream). The one exception is RAW: the sender
-  puts it in a record of its own; the receiver only requires that it is the last frame of its record.
+- A frame may span TLS records (the receiver parses frames from the byte stream). The one exception is RAW: it must be
+  the last frame of its record. Other frames may come before it in that record (the sender puts a PAD there, see §5.2).
 - Address encoding (socksAddr): `family(1) · addr · port(u16 BE)`, with family 0x01 IPv4 (4 B) / 0x03 domain name
   (len(1)+bytes) / 0x04 IPv6 (16 B).
 - There are no stream ids, no SYNACK and no heartbeats.
@@ -103,7 +103,8 @@ boundaries of the inner TLS are tracked on the byte stream, so no single read ha
    depends on this conclusion).
 3. Once "the inner layer is TLS 1.3" holds, when a record header with type = 0x17 is met at a record boundary: the
    batch that contains this record header still goes as DATA, and **from then on this direction is in the raw phase**
-   until END, with no further inspection of the content. The peer must have declared `raw=1`.
+   until END. The content is not inspected any more, but the sender keeps following the inner record boundaries
+   (§5.2). The peer must have declared `raw=1`.
 4. In the raw phase the sender chooses RAW or DATA for each batch (the receiver must accept either at any time). A batch
    smaller than 4 KiB goes as DATA: a RAW frame takes a record of its own, so small data would double the packet count,
    and the little encryption saved is not worth it.
@@ -113,10 +114,20 @@ inner TLS 1.3 ciphertext records.
 
 ### 5.2 Raw segments
 
-- The sender declares as many bytes as it has at hand (at most 1 MiB per segment): it first writes a record holding
-  only the RAW frame, then writes the bytes directly to TCP. Where possible, let the two writes leave together
-  (TCP_CORK on Linux, or a single combined write) so that the record of a few dozen bytes does not take a packet of its
-  own.
+- **A raw segment holds whole inner TLS records only**: it starts and ends on an inner record boundary (at most 1 MiB
+  per segment). Outer records and raw segments alternate on the wire, and raw segments are inner records, so all the
+  bytes of a lane read as one sequence of TLS records. A segment that stopped inside an inner record would put the next
+  outer record in the middle of it, and the bytes would no longer read as TLS — something an observer can tell from the
+  record headers alone. So in the raw phase the sender keeps following the inner record headers:
+  - the start of a record whose rest has not arrived waits for it. The inner TLS cannot use a record before it is
+    complete, so this costs nothing as long as the rest follows promptly; if it does not (the reference implementation
+    waits 20 ms), what has arrived goes as DATA, and so does the rest of that record;
+  - a record begun in DATA (such as the one the switch to the raw phase happened in) also ends in DATA;
+  - if the bytes stop parsing as TLS records, the rest of the direction goes as DATA.
+- The record announcing a segment holds a PAD frame of random length (sometimes none) followed by the RAW frame, so
+  that announcing records do not all have the same length. Then the bytes go directly to TCP. Where possible, let the
+  two writes leave together (TCP_CORK on Linux, or a single combined write) so that the small record does not take a
+  packet of its own.
 - After reading a RAW frame, the receiver takes exactly N bytes from TCP (first those the TLS layer has already read
   into its buffer, then from the socket) and goes back to reading TLS records.
 - Raw segments are not protected by the outer TLS's integrity check; tampering is detected by the inner TLS itself. A
@@ -229,7 +240,8 @@ stop=8
   for them by hand.
 - KeyUpdate on the outer layer is not handled: none of the TLS stacks used by known implementations sends it on its
   own.
-- The server's downlink can be zero-copy on Linux: first ask how many bytes are in the receive buffer of the target
-  connection right now (FIONREAD), write a RAW frame for that number, then splice exactly that many bytes to the client
-  connection — they are already in the kernel, so what was declared can always be delivered. On an abort, finish the
-  segment in hand before closing the connection to the target.
+- The server's downlink can be zero-copy on Linux: look at what is in the receive buffer of the target connection
+  right now without taking it (MSG_PEEK), find the whole inner records among it, write a RAW frame for their length,
+  then splice exactly that many bytes to the client connection — they are already in the kernel, so what was declared
+  can always be delivered. A record that is not complete yet stays in the kernel until it is (or until the wait for it
+  runs out, see §5.2). On an abort, finish the segment in hand before closing the connection to the target.

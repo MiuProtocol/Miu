@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,6 +33,10 @@ const (
 )
 
 var rawPool = sync.Pool{New: func() any { b := make([]byte, rawReadSize); return &b }}
+
+// peekPool holds the buffers the segmented downlink looks at the target's receive buffer with, to find
+// the inner record boundaries in it. A buffer is only held for the length of one look.
+var peekPool = sync.Pool{New: func() any { b := make([]byte, maxSeg); return &b }}
 
 // ErrAuth is returned by Server.Serve when a connection presents an unknown token.
 var ErrAuth = errors.New("miu: auth failed: unknown token")
@@ -576,7 +581,7 @@ func (st *tcpStream) release() {
 // truncated transfer is for the inner protocol to notice. An error means the lane is broken.
 func (st *tcpStream) pumpDown(target net.Conn) error {
 	l := st.l
-	scan := recScan{st: &st.state, dead: !l.canRaw}
+	scan := recScan{st: &st.state, dead: !l.canRaw, follow: true}
 	buf, fb := getBuf(), getBuf()
 	defer putBuf(buf)
 	defer putBuf(fb)
@@ -590,7 +595,7 @@ func (st *tcpStream) pumpDown(target net.Conn) error {
 			}
 			st.traffic.addDown(n, false)
 			if sw && l.peerRaw.Load() && err == nil {
-				return st.pumpRaw(target, buf, fb)
+				return st.pumpRaw(target, &scan, fb)
 			}
 		}
 		if err != nil {
@@ -602,72 +607,201 @@ func (st *tcpStream) pumpDown(target net.Conn) error {
 	return l.writeFrame(frEnd, nil)
 }
 
-// pumpRaw is the raw phase of the downlink.
-func (st *tcpStream) pumpRaw(target net.Conn, buf, fb *[]byte) error {
+// pumpRaw is the raw phase of the downlink. Raw segments carry whole inner records only (see recScan):
+// the start of a record whose rest has not been read yet waits at the front of the buffer for up to
+// holdWait, then goes out as DATA, and so does the rest of that record. A record begun in DATA (the one
+// the switch to the raw phase happened in) also ends in DATA.
+func (st *tcpStream) pumpRaw(target net.Conn, scan *recScan, fb *[]byte) error {
 	l := st.l
 	src, ok := target.(*net.TCPConn)
 	if _, tcp := l.sock.(*net.TCPConn); segmentedCopy && ok && tcp {
-		return st.pumpSegments(src, buf, fb)
+		return st.pumpSegments(src, scan, fb)
 	}
 	bp := rawPool.Get().(*[]byte)
 	defer rawPool.Put(bp)
 	big := *bp
+	held := 0 // bytes at the front of big: the start of an inner record
+	// heldSince is when the record at the front started to be held. The read deadline is set once and
+	// moved on only when it passes: setting it on every read wakes the network poller every time.
+	var heldSince time.Time
+	armed := false
+	sendData := func(p []byte) error {
+		if len(p) == 0 {
+			return nil
+		}
+		st.traffic.addDown(len(p), false)
+		return l.writeUnshaped(appendData((*fb)[:0], p))
+	}
 	for {
-		n, err := target.Read(big)
+		n, err := target.Read(big[held:])
 		if n > 0 {
 			st.timer.update()
+			cont := held == 0 && !scan.atBoundary()
+			fresh := held == 0
+			first, last := scan.walk(big[held : held+n])
+			fresh = fresh || first >= 0
+			p := big[:held+n]
+			held = 0
 			var werr error
-			if n >= rawMin {
-				werr = l.writeRaw(big[:n])
-			} else {
-				werr = l.writeUnshaped(appendData((*fb)[:0], big[:n]))
+			switch {
+			case scan.lost:
+				werr = sendData(p)
+			case cont && first < 0:
+				werr = sendData(p)
+			default:
+				start, cut := 0, -1
+				if cont {
+					start, cut = first, last
+					werr = sendData(p[:first])
+				} else if last >= 0 {
+					cut = len(p) - n + last
+				}
+				if werr == nil && cut > start {
+					if whole := p[start:cut]; len(whole) >= rawMin {
+						werr = l.writeRawRecords(whole, nil)
+						st.traffic.addDown(len(whole), true)
+					} else {
+						werr = sendData(whole)
+					}
+				}
+				if cut < start {
+					cut = start
+				}
+				held = copy(big, p[cut:])
 			}
 			if werr != nil {
 				return werr
 			}
-			st.traffic.addDown(n, n >= rawMin)
+			if held > 0 && fresh {
+				heldSince = time.Now()
+			}
 		}
-		if err != nil {
+		switch {
+		case err == nil:
+		case errors.Is(err, os.ErrDeadlineExceeded):
+			// Only the hold sets a deadline. Clear it: an expired one fails every read that follows.
+			_ = target.SetReadDeadline(time.Time{})
+			armed = false
+			if held > 0 && time.Since(heldSince) >= holdWait {
+				// The rest of the record is late: what has arrived of it goes as DATA, and the rest
+				// will follow as DATA.
+				l.event("holdflush")
+				if werr := sendData(big[:held]); werr != nil {
+					return werr
+				}
+				held = 0
+			}
+		default:
+			if werr := sendData(big[:held]); werr != nil {
+				return werr
+			}
 			return l.writeFrame(frEnd, nil)
+		}
+		switch {
+		case held > 0 && !armed:
+			_ = target.SetReadDeadline(heldSince.Add(holdWait))
+			armed = true
+		case held == 0 && armed:
+			_ = target.SetReadDeadline(time.Time{})
+			armed = false
 		}
 	}
 }
 
-// pumpSegments is the raw phase between two TCP connections: for every segment it asks how many bytes
-// are waiting in the target's receive buffer, declares that many in a RAW frame and moves exactly those.
-// They are already in the kernel, so a declared segment can always be completed. On Linux the move is a
-// splice: the bytes never enter user space.
-func (st *tcpStream) pumpSegments(src *net.TCPConn, buf, fb *[]byte) error {
+// pumpSegments is the raw phase between two TCP connections: it looks at what is waiting in the
+// target's receive buffer without taking it, declares the whole inner records among it in a RAW frame
+// and moves exactly those. They are already in the kernel, so a declared segment can always be
+// completed. On Linux the move is a splice: the bytes do not pass through user space on the way out.
+//
+// An inner record that is not complete yet stays in the kernel until it is, for up to holdWait; then
+// what has arrived of it goes as DATA, and so does its rest.
+func (st *tcpStream) pumpSegments(src *net.TCPConn, scan *recScan, fb *[]byte) error {
 	l := st.l
+	bp := rawPool.Get().(*[]byte)
+	defer rawPool.Put(bp)
+	data := *bp
+	// readData moves up to n bytes into user space and sends them as DATA.
+	readData := func(n int) error {
+		k, err := src.Read(data[:minInt(n, len(data))])
+		if k > 0 {
+			scan.walk(data[:k])
+			st.traffic.addDown(k, false)
+			if werr := l.writeUnshaped(appendData((*fb)[:0], data[:k])); werr != nil {
+				return werr
+			}
+		}
+		return err
+	}
+	// look peeks at up to n waiting bytes and returns how many there are, the end of the last whole
+	// record among them (-1 if none) and how many more bytes complete the first record that is not whole.
+	look := func(n int) (m, last, more int, lost bool, err error) {
+		pp := peekPool.Get().(*[]byte)
+		defer peekPool.Put(pp)
+		peek := *pp
+		if m, err = peekAt(src, peek[:minInt(n, len(peek))]); err != nil {
+			return
+		}
+		probe := scan.clone()
+		_, last = probe.walk(peek[:m])
+		return m, last, probe.remaining(), probe.lost, nil
+	}
+loop:
 	for {
-		n, err := readable(src)
+		if scan.lost {
+			if err := readData(len(data)); err != nil {
+				break
+			}
+			continue
+		}
+		n, err := readable(src, 1, time.Time{})
 		if err != nil {
 			break // end of stream, a reset, or the abort closed the target
 		}
 		st.timer.update()
-		if n < rawMin {
-			k, err := src.Read((*buf)[:rawMin])
-			if k > 0 {
-				if werr := l.writeUnshaped(appendData((*fb)[:0], (*buf)[:k])); werr != nil {
-					return werr
-				}
-				st.traffic.addDown(k, false)
-			}
-			if err != nil {
+		if !scan.atBoundary() {
+			// Finish a record begun in DATA, as DATA.
+			if err := readData(minInt(n, scan.remaining())); err != nil {
 				break
+			}
+			continue
+		}
+		m, last, more, lost, err := look(n)
+		if err != nil {
+			break
+		}
+		switch {
+		case lost:
+			scan.lost = true
+			continue
+		case last <= 0:
+			// Not one whole record yet: wait for the rest of it.
+			need := m + more
+			if _, err := readable(src, need, time.Now().Add(holdWait)); err != nil {
+				if !errors.Is(err, os.ErrDeadlineExceeded) {
+					break loop
+				}
+				l.event("holdflush")
+				if err := readData(m); err != nil {
+					break loop
+				}
+			}
+			continue
+		case last < rawMin:
+			if err := readData(last); err != nil {
+				break loop
 			}
 			continue
 		}
 		if !st.beginSegment() {
 			break
 		}
-		n = minInt(n, maxSeg)
-		err = l.spliceRaw(src, n)
+		err = l.spliceRaw(src, last)
 		st.endSegment()
 		if err != nil {
 			return err // a segment was cut short: the byte count on the lane is off
 		}
-		st.traffic.addDown(n, true)
+		// Whole records went out, so the scan is still on a boundary: nothing to walk.
+		st.traffic.addDown(last, true)
 	}
 	return l.writeFrame(frEnd, nil)
 }

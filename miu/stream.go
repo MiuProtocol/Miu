@@ -11,6 +11,11 @@ import (
 	"time"
 )
 
+// holdWait is how long the tail of an inner record may wait for the rest of the record before it goes
+// out as DATA instead. The inner TLS cannot use a record before it is complete, so holding the tail
+// costs the application nothing as long as the rest follows promptly.
+const holdWait = 20 * time.Millisecond
+
 var (
 	errDownEnd = errors.New("miu: end of downlink")
 	errSwapped = errors.New("miu: lane replaced")
@@ -47,6 +52,12 @@ type stream struct {
 	history []byte // the uplink so far, kept while a replay is still possible
 	frames  []byte // scratch
 
+	// hold is the start of an inner record whose rest has not been written yet: a raw segment only takes
+	// whole records. holdTimer sends it as DATA after holdWait. Guarded by wmu.
+	hold      []byte
+	holdSpare []byte
+	holdTimer *time.Timer
+
 	mu sync.Mutex
 	// replayable: the lane came from the pool, nothing has been received and at most replayLimit sent.
 	// If the lane turns out to be dead the stream starts over on a new one. swapping: that is underway.
@@ -71,7 +82,7 @@ func (c *Client) open(ctx context.Context, open []byte, remote net.Addr, udp boo
 	s := &stream{c: c, remote: remote, open: open, pkt: 1, replayable: pooled, laneUsed: used}
 	s.lane.Store(l)
 	// UDP streams never use raw segments; neither does a lane that cannot carry them.
-	s.upScan = recScan{st: &s.state, dead: udp || !l.canRaw}
+	s.upScan = recScan{st: &s.state, dead: udp || !l.canRaw, follow: true}
 	s.downScan = recScan{st: &s.state, dead: udp || !l.canRaw}
 	s.timer = time.AfterFunc(firstPayloadWait, s.flushOpen)
 	return s, nil
@@ -97,9 +108,10 @@ func (s *stream) Write(p []byte) (int, error) {
 		case len(p) == 0:
 			return total, nil
 		}
-		k := len(p)
-		if !s.raw {
-			k = minInt(k, maxBatch)
+		k := minInt(len(p), maxBatch)
+		if s.raw {
+			// Room for a held record tail: a raw segment stays within maxSeg.
+			k = minInt(len(p), maxSeg/2)
 		}
 		if err := s.send(p[:k]); err != nil {
 			s.werr = err
@@ -114,13 +126,7 @@ func (s *stream) Write(p []byte) (int, error) {
 func (s *stream) send(b []byte) error {
 	l := s.lane.Load()
 	if s.raw {
-		var err error
-		if len(b) >= rawMin {
-			err = l.writeRaw(b)
-		} else {
-			s.frames = appendData(s.frames[:0], b)
-			err = l.writeUnshaped(s.frames)
-		}
+		err := s.sendRaw(l, b)
 		if err != nil {
 			l.close()
 		}
@@ -146,6 +152,97 @@ func (s *stream) send(b []byte) error {
 		s.raw = true
 	}
 	return nil
+}
+
+// sendRaw sends b in the raw phase. Raw segments carry whole inner records only: the start of a record
+// whose rest has not arrived is held back (see holdWait), and a record that has already been partly
+// sent as DATA is finished as DATA. A batch smaller than rawMin goes as DATA. Caller holds wmu.
+func (s *stream) sendRaw(l *lane, b []byte) error {
+	sc := &s.upScan
+	if sc.lost {
+		return s.sendRawData(l, b)
+	}
+	// A record begun in DATA ends in DATA: a raw segment must start on a record boundary.
+	cont := len(s.hold) == 0 && !sc.atBoundary()
+	first, last := sc.walk(b)
+	if sc.lost {
+		// The uplink no longer parses as TLS records: no more raw segments on this stream.
+		h := s.takeHold()
+		if err := s.sendRawData(l, h); err != nil {
+			return err
+		}
+		return s.sendRawData(l, b)
+	}
+	if cont {
+		if first < 0 {
+			return s.sendRawData(l, b)
+		}
+		if err := s.sendRawData(l, b[:first]); err != nil {
+			return err
+		}
+		b, last = b[first:], last-first
+	}
+	// The whole records are hold + b[:last]; the rest of b starts the next record.
+	if last > 0 {
+		whole := b[:last]
+		b = b[last:]
+		h := s.takeHold()
+		var err error
+		if n := len(h) + len(whole); n >= rawMin {
+			err = l.writeRawRecords(h, whole)
+		} else {
+			s.frames = appendData(appendData(s.frames[:0], h), whole)
+			err = l.writeUnshaped(s.frames)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if len(b) > 0 {
+		s.hold = append(s.hold, b...)
+		if s.holdTimer == nil {
+			s.holdTimer = time.AfterFunc(holdWait, s.flushHold)
+		} else {
+			s.holdTimer.Reset(holdWait)
+		}
+	}
+	return nil
+}
+
+// sendRawData sends b as DATA frames, unshaped, in the raw phase. Caller holds wmu.
+func (s *stream) sendRawData(l *lane, b []byte) error {
+	if len(b) == 0 {
+		return nil
+	}
+	s.frames = appendData(s.frames[:0], b)
+	return l.writeUnshaped(s.frames)
+}
+
+// takeHold empties the hold and returns what it had. The two hold buffers take turns, so the result
+// stays valid until the next takeHold. Caller holds wmu.
+func (s *stream) takeHold() []byte {
+	h := s.hold
+	s.hold, s.holdSpare = s.holdSpare[:0], h
+	if s.holdTimer != nil {
+		s.holdTimer.Stop()
+	}
+	return h
+}
+
+// flushHold sends a held record tail as DATA once holdWait has passed without the rest of the record;
+// the rest then follows as DATA too.
+func (s *stream) flushHold() {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	if len(s.hold) == 0 || s.upEnded || s.werr != nil || s.closed.Load() {
+		return
+	}
+	l := s.lane.Load()
+	l.event("holdflush")
+	if err := s.sendRawData(l, s.takeHold()); err != nil {
+		l.close()
+		s.werr = err
+	}
 }
 
 // sendPacket sends b as the next shaped packet, preceded by OPEN if that is still to go.
@@ -205,6 +302,13 @@ func (s *stream) CloseWrite() error {
 		return s.werr
 	}
 	s.timer.Stop()
+	if len(s.hold) > 0 {
+		if err := s.sendRawData(s.lane.Load(), s.takeHold()); err != nil {
+			s.lane.Load().close()
+			s.werr = err
+			return err
+		}
+	}
 	s.upEnded = true
 	// Like shutdown(2), the half-close is not subject to the write deadline. (crypto/tls, when it is
 	// the inner connection, leaves an expired one behind after sending its close_notify.)

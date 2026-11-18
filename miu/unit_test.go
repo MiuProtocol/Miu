@@ -514,3 +514,80 @@ func TestLaneReadResumable(t *testing.T) {
 		t.Fatalf("type %d, data %q, %d timeouts", typ, got, timeouts)
 	}
 }
+
+// In the raw phase the sending side keeps following the inner records: walk reports where records end,
+// however the bytes are cut, and garbage after the switch marks the boundaries as lost.
+func TestRecScanFollow(t *testing.T) {
+	rec := func(n int) []byte {
+		return append([]byte{0x17, 3, 3, byte(n >> 8), byte(n)}, make([]byte, n)...)
+	}
+	var stream []byte
+	var ends []int // absolute offsets just past each record
+	for _, n := range []int{0, 1, 4, 17, 300, 16401, 5, 16640, 2, 999} {
+		stream = append(stream, rec(n)...)
+		ends = append(ends, len(stream))
+	}
+	for _, chunk := range []int{1, 2, 5, 6, 17, 4096, len(stream)} {
+		st := &streamState{}
+		st.tls13.Store(true)
+		s := &recScan{st: st, follow: true}
+		var got []int
+		for i := 0; i < len(stream); i += chunk {
+			end := min(i+chunk, len(stream))
+			first, last := s.walk(stream[i:end])
+			if (first < 0) != (last < 0) || first > last {
+				t.Fatalf("chunk %d at %d: first %d last %d", chunk, i, first, last)
+			}
+			// Every record end inside this chunk lies in [first, last]; the scan reports the extremes.
+			var want []int
+			for _, e := range ends {
+				if e > i && e <= end {
+					want = append(want, e-i)
+				}
+			}
+			switch {
+			case len(want) == 0 && first >= 0:
+				t.Fatalf("chunk %d at %d: boundary %d reported, none expected", chunk, i, first)
+			case len(want) > 0 && (first != want[0] || last != want[len(want)-1]):
+				t.Fatalf("chunk %d at %d: got [%d,%d], want [%d,%d]", chunk, i, first, last, want[0], want[len(want)-1])
+			}
+			if last >= 0 {
+				got = append(got, i+last)
+			}
+			if at := s.atBoundary(); at != (len(want) > 0 && want[len(want)-1] == end-i) && !(i == 0 && end == 0) {
+				t.Fatalf("chunk %d at %d: atBoundary %v", chunk, i, at)
+			}
+		}
+		if !s.ready || s.lost || !s.atBoundary() {
+			t.Fatalf("chunk %d: ready %v lost %v boundary %v", chunk, s.ready, s.lost, s.atBoundary())
+		}
+		if len(got) == 0 || got[len(got)-1] != len(stream) {
+			t.Fatalf("chunk %d: the stream does not end on a boundary: %v", chunk, got)
+		}
+	}
+
+	// remaining: what completes the header, then the record.
+	st := &streamState{}
+	st.tls13.Store(true)
+	s := &recScan{st: st, follow: true}
+	s.walk([]byte{0x17, 3})
+	if s.remaining() != 3 {
+		t.Fatalf("remaining in a header: %d", s.remaining())
+	}
+	s.walk([]byte{3, 0, 10, 1, 2})
+	if s.remaining() != 8 || s.atBoundary() {
+		t.Fatalf("remaining in a body: %d", s.remaining())
+	}
+	probe := s.clone()
+	probe.walk(make([]byte, 8))
+	if !probe.atBoundary() || s.remaining() != 8 {
+		t.Fatal("clone is not independent")
+	}
+
+	// After the switch, bytes that are not TLS records end the following.
+	s.walk(make([]byte, 8))
+	s.walk([]byte("GET / HTTP/1.1\r\n"))
+	if !s.lost || s.dead {
+		t.Fatalf("lost %v dead %v", s.lost, s.dead)
+	}
+}
