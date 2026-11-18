@@ -44,7 +44,6 @@ type stream struct {
 	// Lock order: rmu, wmu, mu.
 	wmu     sync.Mutex
 	opened  bool // OPEN has been sent
-	pkt     uint32
 	upScan  recScan
 	raw     bool // the uplink is in its raw phase
 	upEnded bool // END has been sent
@@ -79,7 +78,7 @@ func (c *Client) open(ctx context.Context, open []byte, remote net.Addr, udp boo
 	if err != nil {
 		return nil, err
 	}
-	s := &stream{c: c, remote: remote, open: open, pkt: 1, replayable: pooled, laneUsed: used}
+	s := &stream{c: c, remote: remote, open: open, replayable: pooled, laneUsed: used}
 	s.lane.Store(l)
 	// UDP streams never use raw segments; neither does a lane that cannot carry them.
 	s.upScan = recScan{st: &s.state, dead: udp || !l.canRaw, follow: true}
@@ -256,11 +255,10 @@ func (s *stream) sendPacket(l *lane, b []byte) error {
 		s.frames = append(s.frames, s.open...)
 	}
 	s.frames = appendData(s.frames, b)
-	if err := l.writePacket(s.pkt, s.frames); err != nil {
+	if err := l.writeLanePacket(s.frames); err != nil {
 		return err
 	}
 	s.opened = true
-	s.pkt++
 	return nil
 }
 
@@ -370,7 +368,7 @@ func (s *stream) replay(old *lane) bool {
 	cancel()
 	if err == nil {
 		// The new lane is fresh: the packet numbering starts over.
-		err = nl.writePacket(1, appendData(append([]byte(nil), s.open...), s.history))
+		err = nl.writeLanePacket(appendData(append([]byte(nil), s.open...), s.history))
 		if err == nil && s.upEnded {
 			err = nl.writeFrame(frEnd, nil)
 		}
@@ -397,7 +395,7 @@ func (s *stream) replay(old *lane) bool {
 		}
 	}
 	s.lane.Store(nl)
-	s.opened, s.pkt = true, 2
+	s.opened = true
 	nl.event("replay")
 	return true
 }

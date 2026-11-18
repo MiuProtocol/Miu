@@ -274,7 +274,7 @@ func TestWritePacketShaping(t *testing.T) {
 func TestEndIsNotShaped(t *testing.T) {
 	for _, withData := range []bool{true, false} {
 		l, peer := pipeLane(t)
-		s := &stream{c: &Client{}, open: appendFrame(nil, frOpen, []byte{1, 127, 0, 0, 1, 0, 80}), pkt: 1}
+		s := &stream{c: &Client{}, open: appendFrame(nil, frOpen, []byte{1, 127, 0, 0, 1, 0, 80})}
 		s.lane.Store(l)
 		s.upScan = recScan{st: &s.state, dead: true}
 		s.timer = time.NewTimer(time.Hour)

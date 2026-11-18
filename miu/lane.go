@@ -37,6 +37,12 @@ type lane struct {
 	// prefixTimer writes it alone if nothing else is written in time. Guarded by wmu.
 	prefix      []byte
 	prefixTimer *time.Timer
+	// sent counts the packets written on the lane in its sending direction (writeLanePacket): only the
+	// lane's first ones are shaped, whatever stream they belong to. Guarded by wmu.
+	sent uint32
+	// base is the scheme whose md5 is exchanged in Settings: the PSK-derived one or an explicit one. The
+	// lane shapes with scheme, which is its own draw from base's family when base is derived.
+	base *paddingScheme
 
 	scheme atomic.Pointer[paddingScheme]
 	closed atomic.Bool
@@ -309,12 +315,26 @@ func (l *lane) writeUnshaped(p []byte) error {
 	return l.write(l.padSmall(p))
 }
 
+// writeLanePacket sends one "packet" (a few encoded frames) as the lane's next one. Packets are counted
+// per lane, not per stream: the shaping covers the start of the lane only. Shaping every stream the same
+// way would repeat the scheme's lengths at the start of every stream a lane carries, which is easy to see.
+func (l *lane) writeLanePacket(p []byte) error {
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+	l.sent++
+	return l.writePacketLocked(l.sent, p)
+}
+
 // writePacket sends one "packet" (a few encoded frames). While pkt is below the scheme's stop, the packet
 // is cut into TLS records of the prescribed lengths, the last one filled up with a PAD frame; otherwise it
 // goes out in one write. A cut may fall inside a frame: the peer parses frames from the byte stream.
 func (l *lane) writePacket(pkt uint32, p []byte) error {
 	l.wmu.Lock()
 	defer l.wmu.Unlock()
+	return l.writePacketLocked(pkt, p)
+}
+
+func (l *lane) writePacketLocked(pkt uint32, p []byte) error {
 	scheme := l.scheme.Load()
 	var sizes []int
 	if scheme != nil && pkt < scheme.stop {

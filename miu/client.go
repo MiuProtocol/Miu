@@ -61,6 +61,9 @@ type Client struct {
 
 	paddingMu sync.RWMutex
 	padding   *paddingScheme
+	// derived: padding is the PSK-derived scheme (nothing configured, nothing pushed by the server), so
+	// each lane draws its own scheme from that family.
+	derived bool
 
 	mu       sync.Mutex
 	idle     []idleLane
@@ -101,7 +104,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 			return nil, errors.New("miu: bad padding scheme")
 		}
 	}
-	return &Client{cfg: cfg, token: token, padding: padding}, nil
+	return &Client{cfg: cfg, token: token, padding: padding, derived: cfg.PaddingScheme == ""}, nil
 }
 
 // TLSDialer returns a ClientConfig.Dial that connects to address over TCP and performs a TLS handshake
@@ -126,13 +129,19 @@ func TLSDialer(address string, cfg *tls.Config) func(ctx context.Context) (net.C
 // ---- the lane pool ----
 
 func (c *Client) currentPadding() *paddingScheme {
+	p, _ := c.basePadding()
+	return p
+}
+
+// basePadding returns the scheme new lanes start from and whether it is the PSK-derived one.
+func (c *Client) basePadding() (*paddingScheme, bool) {
 	c.paddingMu.RLock()
-	p := c.padding
+	p, derived := c.padding, c.derived
 	c.paddingMu.RUnlock()
 	if p == nil {
-		return defaultScheme
+		return defaultScheme, false
 	}
-	return p
+	return p, derived
 }
 
 func (c *Client) updatePadding(p *paddingScheme) {
@@ -140,7 +149,7 @@ func (c *Client) updatePadding(p *paddingScheme) {
 		return
 	}
 	c.paddingMu.Lock()
-	c.padding = p
+	c.padding, c.derived = p, false
 	c.paddingMu.Unlock()
 }
 
@@ -158,13 +167,18 @@ func (c *Client) dial(ctx context.Context, forStream bool) (*lane, error) {
 	}
 	l := newLane(conn, false, !c.cfg.DisableRaw)
 	l.client = c
-	l.scheme.Store(c.currentPadding())
-	scheme := l.scheme.Load()
+	base, derived := c.basePadding()
+	scheme := base
+	if derived {
+		scheme = newLaneScheme(c.token, base)
+	}
+	l.base = base
+	l.scheme.Store(scheme)
 	padlen := scheme.padding0()
 	hello := append(make([]byte, 0, authHead+int(padlen)+64), c.token[:]...)
 	hello = append(hello, byte(padlen>>8), byte(padlen))
 	hello = append(hello, make([]byte, padlen)...)
-	hello = appendFrame(hello, frSettings, l.settingsText("\npadding-md5="+scheme.md5))
+	hello = appendFrame(hello, frSettings, l.settingsText("\npadding-md5="+base.md5))
 	if forStream {
 		l.prefix = hello
 		l.event("dial")

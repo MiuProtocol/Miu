@@ -206,11 +206,17 @@ func (s *Server) Serve(ctx context.Context, conn net.Conn) error {
 	}
 
 	l := newLane(conn, true, !s.cfg.DisableRaw)
-	laneScheme, err := s.schemeForToken([32]byte(h[:32]))
+	token := [32]byte(h[:32])
+	base, err := s.schemeForToken(token)
 	if err != nil {
 		return err
 	}
-	l.scheme.Store(laneScheme)
+	l.base = base
+	if s.cfg.PaddingScheme == "" {
+		l.scheme.Store(newLaneScheme(token, base)) // this lane's own draw, for the downlink
+	} else {
+		l.scheme.Store(base)
+	}
 	// Close the lane when ctx is done.
 	go func() {
 		select {
@@ -333,9 +339,14 @@ func (s *Server) handleSettings(l *lane, text string) error {
 	kv := parseKV(text)
 	l.peerRaw.Store(kv["raw"] == "1")
 	reply := appendFrame(nil, frServerSettings, l.settingsText(fmt.Sprintf("\nidle=%d", int(s.cfg.IdleTimeout/time.Second))))
-	scheme := l.scheme.Load()
-	if md5 := strings.ToLower(strings.TrimSpace(kv["padding-md5"])); md5 != "" && md5 != scheme.md5 {
-		reply = appendFrame(reply, frUpdatePadding, scheme.raw)
+	// The client is told the scheme its lanes should come from when its md5 is not that of the lane's
+	// base (the PSK-derived scheme, or the configured one).
+	base := l.base
+	if base == nil {
+		base = l.scheme.Load()
+	}
+	if md5 := strings.ToLower(strings.TrimSpace(kv["padding-md5"])); md5 != "" && md5 != base.md5 {
+		reply = appendFrame(reply, frUpdatePadding, base.raw)
 	}
 	l.deferPrefix(reply, settingsWait)
 	return nil
@@ -592,12 +603,12 @@ func (st *tcpStream) pumpDown(target net.Conn) error {
 	buf, fb := getBuf(), getBuf()
 	defer putBuf(buf)
 	defer putBuf(fb)
-	for pkt := uint32(1); ; pkt++ {
+	for {
 		n, err := target.Read((*buf)[:maxBatch])
 		if n > 0 {
 			st.timer.update()
 			sw := scan.feed((*buf)[:n])
-			if werr := l.writePacket(pkt, appendData((*fb)[:0], (*buf)[:n])); werr != nil {
+			if werr := l.writeLanePacket(appendData((*fb)[:0], (*buf)[:n])); werr != nil {
 				return werr
 			}
 			st.traffic.addDown(n, false)

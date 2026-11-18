@@ -2,9 +2,12 @@ package miu
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 )
@@ -21,21 +24,26 @@ type derivedPaddingReader struct {
 	block   []byte
 	pos     int
 	counter uint32
+	info    string
 }
 
 func newDerivedPaddingReader(authToken [32]byte) (*derivedPaddingReader, error) {
+	return newDerivedPaddingReaderInfo(authToken, derivedProfileInfo)
+}
+
+func newDerivedPaddingReaderInfo(authToken [32]byte, info string) (*derivedPaddingReader, error) {
 	prk := hmac.New(sha256.New, []byte(derivedProfileSalt))
 	_, _ = prk.Write(authToken[:])
-	block, err := hkdfExpand(prk.Sum(nil), derivedProfileInfo, derivedProfileBlock)
+	block, err := hkdfExpand(prk.Sum(nil), info, derivedProfileBlock)
 	if err != nil {
 		return nil, err
 	}
-	return &derivedPaddingReader{prk: prk.Sum(nil), block: block}, nil
+	return &derivedPaddingReader{prk: prk.Sum(nil), block: block, info: info}, nil
 }
 
 func (r *derivedPaddingReader) refill() error {
 	r.counter++
-	info := derivedProfileInfo + "/counter/" + strconv.FormatUint(uint64(r.counter), 10)
+	info := r.info + "/counter/" + strconv.FormatUint(uint64(r.counter), 10)
 	block, err := hkdfExpand(r.prk, info, derivedProfileBlock)
 	if err != nil {
 		return err
@@ -101,6 +109,39 @@ func derivePaddingScheme(authToken [32]byte) (*paddingScheme, error) {
 	if err != nil {
 		return nil, err
 	}
+	return generatePaddingScheme(r)
+}
+
+// laneProfileInfo is the HKDF info prefix of a lane's own scheme; the lane's nonce follows it.
+const laneProfileInfo = derivedProfileInfo + "/lane/"
+
+// deriveLanePaddingScheme draws one lane's scheme from the same family as the PSK-derived one: the same
+// generator and bounds, fed by HKDF over the authentication token with a random per-lane nonce. Each
+// side does this on its own, for what it sends, and tells nobody: shaping is the sender's business and
+// the receiver does not check it, so no wire change is needed. Settings still carries the md5 of the
+// PSK-derived scheme. Lanes of one user therefore do not share one fixed set of lengths.
+func deriveLanePaddingScheme(authToken [32]byte, nonce []byte) (*paddingScheme, error) {
+	r, err := newDerivedPaddingReaderInfo(authToken, laneProfileInfo+hex.EncodeToString(nonce))
+	if err != nil {
+		return nil, err
+	}
+	return generatePaddingScheme(r)
+}
+
+// newLaneScheme returns a fresh lane scheme from base's family, or base when no nonce can be had.
+func newLaneScheme(authToken [32]byte, base *paddingScheme) *paddingScheme {
+	var nonce [16]byte
+	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
+		return base
+	}
+	if p, err := deriveLanePaddingScheme(authToken, nonce[:]); err == nil {
+		return p
+	}
+	return base
+}
+
+// generatePaddingScheme is the generator of the derived schemes, reading its choices from r.
+func generatePaddingScheme(r *derivedPaddingReader) (*paddingScheme, error) {
 	count, err := r.sample(4, 10)
 	if err != nil {
 		return nil, err
