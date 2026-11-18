@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// holdWait is how long the tail of an inner record may wait for the rest of the record before it goes
-// out as DATA instead. The inner TLS cannot use a record before it is complete, so holding the tail
+// holdWait is how long the start of an inner record may wait for the rest of the record, counted from
+// when it was first held, before it goes out as DATA instead. The inner TLS cannot use a record before it is complete, so holding the tail
 // costs the application nothing as long as the rest follows promptly.
 const holdWait = 20 * time.Millisecond
 
@@ -199,12 +199,16 @@ func (s *stream) sendRaw(l *lane, b []byte) error {
 		}
 	}
 	if len(b) > 0 {
-		s.hold = append(s.hold, b...)
-		if s.holdTimer == nil {
-			s.holdTimer = time.AfterFunc(holdWait, s.flushHold)
-		} else {
-			s.holdTimer.Reset(holdWait)
+		// The wait counts from when the start of the record was first held: more pieces of the same
+		// record do not extend it.
+		if len(s.hold) == 0 {
+			if s.holdTimer == nil {
+				s.holdTimer = time.AfterFunc(holdWait, s.flushHold)
+			} else {
+				s.holdTimer.Reset(holdWait)
+			}
 		}
+		s.hold = append(s.hold, b...)
 	}
 	return nil
 }

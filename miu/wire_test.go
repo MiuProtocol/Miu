@@ -11,6 +11,7 @@ import (
 	mrand "math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -290,4 +291,97 @@ func wireTransfers(t *testing.T, outer string, events func(string) int) {
 	t.Logf("raw segments: client %d, server %d (splice %d); hold flushed: client %d, server %d; small records %d",
 		events("client:raw"), events("server:raw"), events("server:splice"),
 		events("client:holdflush"), events("server:holdflush"), small)
+}
+
+// dripConn writes slowly once drip is set: every write goes out in ten pieces, 10 ms apart — each gap
+// shorter than holdWait, the whole write much longer.
+type dripConn struct {
+	net.Conn
+	drip atomic.Bool
+}
+
+func (c *dripConn) Write(p []byte) (int, error) {
+	if !c.drip.Load() || len(p) < 10 {
+		return c.Conn.Write(p)
+	}
+	total, step := 0, (len(p)+9)/10
+	for len(p) > 0 {
+		k := min(step, len(p))
+		n, err := c.Conn.Write(p[:k])
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if p = p[k:]; len(p) > 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	return total, nil
+}
+
+// The hold is bounded from the moment the start of a record was first held, not from the last piece
+// of it: a record that trickles in, piece after piece, each sooner than holdWait after the one before,
+// still has its start sent (as DATA) once holdWait has passed. Both directions.
+func TestHoldWaitBoundsFirstByte(t *testing.T) {
+	for _, segmented := range []bool{false, true} {
+		if segmented && !miu.CanSegment() {
+			continue
+		}
+		t.Run(fmt.Sprintf("segmented=%v", segmented), func(t *testing.T) {
+			old := miu.SetSegmentedCopy(segmented)
+			defer miu.SetSegmentedCopy(old)
+			holdWaitTrickle(t)
+		})
+	}
+}
+
+func holdWaitTrickle(t *testing.T) {
+	events := collectEvents(t)
+	addr, _ := startServer(t, pairOptions{outer: "tls"})
+	c, err := miu.NewClient(miu.ClientConfig{PSK: testPSK, Dial: miu.TLSDialer(addr, &tls.Config{ServerName: "localhost", InsecureSkipVerify: true})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	cfg, wrap := innerTLS(t)
+	const warm, slow = 64 << 10, 16000
+	target := listen(t, func(conn net.Conn) {
+		defer conn.Close()
+		dc := &dripConn{Conn: conn}
+		tc := tls.Server(dc, cfg)
+		// Uplink: the warm-up, then one record written slowly by the client.
+		if _, err := io.CopyN(io.Discard, tc, warm+slow); err != nil {
+			return
+		}
+		// Downlink: the warm-up, then one record written slowly by the target.
+		buf := make([]byte, warm)
+		if _, err := tc.Write(buf); err != nil {
+			return
+		}
+		dc.drip.Store(true)
+		_, _ = tc.Write(buf[:slow])
+	})
+	conn, err := c.DialContext(context.Background(), "tcp", target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dc := &dripConn{Conn: conn}
+	tc := wrap(dc)
+	defer tc.Close()
+	if _, err := tc.Write(make([]byte, warm)); err != nil { // into the raw phase
+		t.Fatal(err)
+	}
+	dc.drip.Store(true)
+	if _, err := tc.Write(make([]byte, slow)); err != nil {
+		t.Fatal(err)
+	}
+	dc.drip.Store(false)
+	if n, err := io.CopyN(io.Discard, tc, warm+slow); err != nil {
+		t.Fatalf("download: %d %v", n, err)
+	}
+	for _, e := range []string{"client:holdflush", "server:holdflush"} {
+		if events(e) == 0 {
+			t.Errorf("%s: a record trickling in kept its start held past holdWait", e)
+		}
+	}
 }
