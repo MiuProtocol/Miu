@@ -6,10 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // lane is one authenticated connection: a TCP connection, the outer TLS on top of it, and one
@@ -31,7 +31,13 @@ type lane struct {
 	server  bool
 	client  *Client
 
-	wmu    sync.Mutex
+	wmu sync.Mutex
+	// prefix is written at the very start of the next write, in the same record: the client's
+	// authentication header and Settings on a lane dialed for a stream, the server's ServerSettings.
+	// prefixTimer writes it alone if nothing else is written in time. Guarded by wmu.
+	prefix      []byte
+	prefixTimer *time.Timer
+
 	scheme atomic.Pointer[paddingScheme]
 	closed atomic.Bool
 	done   chan struct{} // closed by close
@@ -248,22 +254,59 @@ func (l *lane) discardToEnd() error {
 
 // ---- writing ----
 
+// write writes p, preceded by the pending prefix if there is one. Caller holds wmu (or owns the lane).
 func (l *lane) write(p []byte) error {
+	if len(l.prefix) > 0 {
+		p = append(l.prefix[:len(l.prefix):len(l.prefix)], p...)
+		l.prefix = nil
+		if l.prefixTimer != nil {
+			l.prefixTimer.Stop()
+		}
+	}
 	_, err := l.conn.Write(p)
 	return err
+}
+
+// deferPrefix queues b to go out at the start of the next write; if nothing is written within wait, it
+// goes alone (padded like any small record).
+func (l *lane) deferPrefix(b []byte, wait time.Duration) {
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+	l.prefix = append(l.prefix, b...)
+	if l.prefixTimer == nil {
+		l.prefixTimer = time.AfterFunc(wait, l.flushPrefixLocked)
+	} else {
+		l.prefixTimer.Reset(wait)
+	}
+}
+
+func (l *lane) flushPrefixLocked() {
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+	if err := l.flushPrefix(); err != nil {
+		l.close()
+	}
+}
+
+// flushPrefix writes a pending prefix on its own. Caller holds wmu.
+func (l *lane) flushPrefix() error {
+	if len(l.prefix) == 0 || l.closed.Load() {
+		return nil
+	}
+	return l.write(l.padSmall(nil))
 }
 
 func (l *lane) writeFrame(typ byte, payload []byte) error {
 	l.wmu.Lock()
 	defer l.wmu.Unlock()
-	return l.write(appendFrame(make([]byte, 0, frameHead+len(payload)), typ, payload))
+	return l.write(l.padSmall(appendFrame(make([]byte, 0, frameHead+len(payload)), typ, payload)))
 }
 
-// writeUnshaped writes already encoded frames as they are.
+// writeUnshaped writes already encoded frames as they are, padded if they make a small record.
 func (l *lane) writeUnshaped(p []byte) error {
 	l.wmu.Lock()
 	defer l.wmu.Unlock()
-	return l.write(p)
+	return l.write(l.padSmall(p))
 }
 
 // writePacket sends one "packet" (a few encoded frames). While pkt is below the scheme's stop, the packet
@@ -313,25 +356,13 @@ func (l *lane) writePacket(pkt uint32, p []byte) error {
 	return nil
 }
 
-// rawHeaderPadMax bounds the PAD frame put in front of a RAW frame. The record announcing a raw segment
-// would otherwise always be the same few dozen bytes long, before every segment — an easy pattern to
-// match. The range is a placeholder until it is measured against real HTTPS traffic.
-const rawHeaderPadMax = 256
-
-var rawPadZeros [rawHeaderPadMax]byte
-
-// writeRawHeader writes the record announcing a raw segment: a PAD frame of random length (sometimes
-// none), then the RAW frame, which has to be the last frame of its record. n raw bytes follow. Caller
-// holds wmu.
+// writeRawHeader writes the record announcing a raw segment: the RAW frame, which has to be the last
+// frame of its record, padded in front like any small record (it would otherwise always be the same few
+// dozen bytes long, before every segment). n raw bytes follow. Caller holds wmu.
 func (l *lane) writeRawHeader(n int) error {
-	var b [frameHead + rawHeaderPadMax + frameHead + 4]byte
-	p := b[:0]
-	if pad := rand.Intn(rawHeaderPadMax + 1); pad >= frameHead {
-		p = appendFrame(p, frPad, rawPadZeros[:pad-frameHead])
-	}
-	p = append(p, frRaw, 0, 4, 0, 0, 0, 0)
-	binary.BigEndian.PutUint32(p[len(p)-4:], uint32(n))
-	return l.write(p)
+	hdr := [frameHead + 4]byte{frRaw, 0, 4}
+	binary.BigEndian.PutUint32(hdr[frameHead:], uint32(n))
+	return l.write(l.padSmall(hdr[:]))
 }
 
 // writeRaw sends p as raw segments: a record with the RAW frame, then the bytes straight to the socket.

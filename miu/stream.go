@@ -366,7 +366,7 @@ func (s *stream) replay(old *lane) bool {
 	old.close()
 	s.c.CloseIdle()
 	ctx, cancel := context.WithTimeout(context.Background(), defaultDialTimeout)
-	nl, err := s.c.dial(ctx)
+	nl, err := s.c.dial(ctx, true)
 	cancel()
 	if err == nil {
 		// The new lane is fresh: the packet numbering starts over.

@@ -321,8 +321,14 @@ func (s *Server) Serve(ctx context.Context, conn net.Conn) error {
 	}
 }
 
+// settingsWait is how long ServerSettings waits for the lane's next write to go out with. The client
+// needs it only once its stream is past the inner handshake, which starts with the server's first
+// downlink write; until then it would be a short record of its own.
+const settingsWait = time.Second
+
 // handleSettings notes whether the client can receive raw segments and answers with ServerSettings,
-// followed by the server's padding scheme when the client's md5 differs.
+// followed by the server's padding scheme when the client's md5 differs. The answer goes out at the start
+// of the next write on the lane, or alone after settingsWait.
 func (s *Server) handleSettings(l *lane, text string) error {
 	kv := parseKV(text)
 	l.peerRaw.Store(kv["raw"] == "1")
@@ -331,7 +337,8 @@ func (s *Server) handleSettings(l *lane, text string) error {
 	if md5 := strings.ToLower(strings.TrimSpace(kv["padding-md5"])); md5 != "" && md5 != scheme.md5 {
 		reply = appendFrame(reply, frUpdatePadding, scheme.raw)
 	}
-	return l.writeUnshaped(reply)
+	l.deferPrefix(reply, settingsWait)
+	return nil
 }
 
 // activityTimer calls f once nothing has called update for d.

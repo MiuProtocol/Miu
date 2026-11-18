@@ -34,6 +34,10 @@ token = sha256(psk string)        // the UTF-8 bytes of the configured string wi
 - `padlen` is entry 0 of the padding scheme (30 by default).
 - The Settings frame follows the authentication header immediately (in the same write). After that the client may open
   a stream at any time, **without waiting for any reply**.
+- A lane dialed for a stream holds the header and Settings back until the stream's opening packet (§5) and sends them
+  at its start, in the same record, so that a new connection does not open with a short record of its own. A lane
+  dialed to warm the pool sends them at once, and so does a lane that goes back to the pool before anything was
+  written on it. Either way nothing is waited for.
 
 ## 3. Frames
 
@@ -71,6 +75,9 @@ S→C  v=2 · raw=0|1 · idle=<seconds the server keeps an idle lane>
   purpose: by the time it wants to send a raw segment (after the inner handshake) ServerSettings has long arrived.
 - When the server sees a `padding-md5` different from its own scheme, it follows ServerSettings with an
   UpdatePaddingScheme frame.
+- The server may hold ServerSettings (and UpdatePaddingScheme) back until its next write on the lane and send them at
+  the start of it, for a short while at most (the reference implementation: 1 s), so that they do not make a short
+  record of their own. The first downlink write of the first stream normally takes them.
 - ServerSettings / UpdatePaddingScheme / PAD may appear anywhere; every place that reads frames must accept them.
 
 ## 5. A stream
@@ -124,8 +131,8 @@ inner TLS 1.3 ciphertext records.
     waits 20 ms), what has arrived goes as DATA, and so does the rest of that record;
   - a record begun in DATA (such as the one the switch to the raw phase happened in) also ends in DATA;
   - if the bytes stop parsing as TLS records, the rest of the direction goes as DATA.
-- The record announcing a segment holds a PAD frame of random length (sometimes none) followed by the RAW frame, so
-  that announcing records do not all have the same length. Then the bytes go directly to TCP. Where possible, let the
+- The record announcing a segment is padded like any small record (§6), so that announcing records do not all have
+  the same length; the PAD goes in front of the RAW frame. Then the bytes go directly to TCP. Where possible, let the
   two writes leave together (TCP_CORK on Linux, or a single combined write) so that the small record does not take a
   packet of its own.
 - After reading a RAW frame, the receiver takes exactly N bytes from TCP (first those the TLS layer has already read
@@ -180,12 +187,20 @@ stop=8
   lengths, filled up with PAD frames where the data is short; whatever is left when the scheme runs out follows in one
   piece. `c` means "stop here if the data has all been sent, otherwise keep cutting".
 - RAW frames and raw segments are not shaped (once in the raw phase there are no "packets" any more).
-- **END is not shaped, and it is the last byte of its direction**: no PAD and no record of any kind may follow END.
+- **END is not shaped by the scheme, and it is the last byte of its direction**: no PAD and no record of any kind may
+  follow END (a PAD in front of it, in the same record, is fine — see small records below).
   Bytes that arrive after the lane has gone back to the pool are taken by the peer as "the server is closing this
   lane", and the lane is dropped.
 - `padding-md5` is the md5 of the scheme text bytes (lowercase hex). The text of the default scheme is the 9 lines
   above joined with `\n`, without a trailing newline; for a scheme pushed by the server it is computed over the bytes in
   the UpdatePaddingScheme frame.
+
+- **Small records.** A record written outside the shaped packets that would be shorter than 300 bytes on the wire
+  (END, RESET, ServerSettings, the record announcing a raw segment, a short DATA) is padded in front with a PAD frame to
+  a length drawn from the lengths of small records in real HTTPS, at or above what it needs. Without this such
+  records have lengths that are a fixed function of what they carry — END alone is always 20 bytes on the wire. The
+  reference implementation carries a table of lengths measured from browser traffic, one for each direction. This only
+  changes what is sent; receivers already skip PAD.
 
 ## 7. UDP (UoT v2; the wire format is the same as sing's)
 

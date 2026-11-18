@@ -146,7 +146,12 @@ func (c *Client) updatePadding(p *paddingScheme) {
 
 // dial opens a new lane: the outer handshake, then the authentication header, its padding and Settings
 // in a single write. Nothing is waited for.
-func (c *Client) dial(ctx context.Context) (*lane, error) {
+//
+// A lane dialed for a stream (forStream) does not write them yet: they go at the start of the stream's
+// first write, in the same record — the stream's opening packet, which follows within firstPayloadWait —
+// so that a new connection does not start with a short record of its own. A lane that goes back to the
+// pool before anything was written sends them then (put).
+func (c *Client) dial(ctx context.Context, forStream bool) (*lane, error) {
 	conn, err := c.cfg.Dial(ctx)
 	if err != nil {
 		return nil, err
@@ -160,6 +165,11 @@ func (c *Client) dial(ctx context.Context) (*lane, error) {
 	hello = append(hello, byte(padlen>>8), byte(padlen))
 	hello = append(hello, make([]byte, padlen)...)
 	hello = appendFrame(hello, frSettings, l.settingsText("\npadding-md5="+scheme.md5))
+	if forStream {
+		l.prefix = hello
+		l.event("dial")
+		return l, nil
+	}
 	if err := l.write(hello); err != nil {
 		l.close()
 		return nil, err
@@ -229,7 +239,7 @@ func (c *Client) get(ctx context.Context) (l *lane, pooled, used bool, err error
 	for i := 0; i < warm; i++ {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), defaultDialTimeout)
-			nl, err := c.dial(ctx)
+			nl, err := c.dial(ctx, false)
 			cancel()
 			c.mu.Lock()
 			c.pending--
@@ -244,12 +254,20 @@ func (c *Client) get(ctx context.Context) (l *lane, pooled, used bool, err error
 		l.event("reuse")
 		return l, true, used, nil
 	}
-	l, err = c.dial(ctx)
+	l, err = c.dial(ctx, true)
 	return l, false, false, err
 }
 
 // put returns a lane to the pool.
 func (c *Client) put(l *lane, used bool) {
+	// A lane dialed for a stream that never wrote anything still owes the server its authentication.
+	l.wmu.Lock()
+	err := l.flushPrefix()
+	l.wmu.Unlock()
+	if err != nil {
+		l.close()
+		return
+	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
