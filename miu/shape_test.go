@@ -200,39 +200,41 @@ func TestColdLaneMergesHello(t *testing.T) {
 	conn2.Close()
 }
 
-// A lane that goes back to the pool before anything was written sends its authentication then, so that
-// the server does not time it out and the next stream can use it.
-func TestColdLaneAbortedBeforeWriting(t *testing.T) {
+// A lane that has not been used — warming the pool, or dialed for a stream that went away before writing —
+// sends nothing at all: its header waits for the lane's first write, and the lane waits in the pool no
+// longer than the server's handshake timeout allows.
+func TestUnusedLaneStaysSilent(t *testing.T) {
 	c, peers := pipeClient(t)
-	l, err := c.dial(context.Background(), true)
+	l, err := c.dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	peer := <-peers
+	c.put(l, false)
+	_ = peer.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+	if n, err := peer.Read(make([]byte, 1)); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("an unused lane wrote: %d %v", n, err)
+	}
+	if !l.unauthed.Load() {
+		t.Fatal("the lane counts as authenticated")
+	}
+	if d := c.ttl(l, 0); d != l.preauthTTL || d < preauthLaneTTL*8/10 || d > preauthLaneTTL {
+		t.Fatalf("an unused lane is kept %v (preauth %v)", d, l.preauthTTL)
+	}
+	if d := c.ttl(l, 0); d >= defaultHandshakeTimeout {
+		t.Fatalf("an unused lane is kept %v, the server waits %v", d, defaultHandshakeTimeout)
+	}
+	// Its first use carries the header.
 	got := make(chan []byte, 1)
 	go func() { got <- readHello(t, c, peer) }()
-	c.put(l, false)
-	if f := withoutPad(frameTypes(<-got)); !bytes.Equal(f, []byte{frSettings}) {
-		t.Fatalf("frames after the header: %v, want Settings", f)
-	}
-	c.mu.Lock()
-	pooled := len(c.idle)
-	c.mu.Unlock()
-	if pooled != 1 {
-		t.Fatalf("%d lanes in the pool", pooled)
-	}
-}
-
-// A lane dialed to warm the pool sends its header at once.
-func TestWarmLaneSendsHelloAtOnce(t *testing.T) {
-	c, peers := pipeClient(t)
-	got := make(chan []byte, 1)
-	go func() { got <- readHello(t, c, <-peers) }()
-	if _, err := c.dial(context.Background(), false); err != nil {
+	if err := l.writeUnshaped(appendData(nil, []byte("x"))); err != nil {
 		t.Fatal(err)
 	}
-	if f := withoutPad(frameTypes(<-got)); !bytes.Equal(f, []byte{frSettings}) {
+	if f := withoutPad(frameTypes(<-got)); !bytes.Equal(f, []byte{frSettings, frData}) {
 		t.Fatalf("frames after the header: %v", f)
+	}
+	if l.unauthed.Load() {
+		t.Fatal("still unauthenticated after the first write")
 	}
 }
 

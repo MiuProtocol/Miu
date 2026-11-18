@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	mrand "math/rand"
 )
 
 // lane is one authenticated connection: a TCP connection, the outer TLS on top of it, and one
@@ -40,6 +42,14 @@ type lane struct {
 	// sent counts the packets written on the lane in its sending direction (writeLanePacket): only the
 	// lane's first ones are shaped, whatever stream they belong to. Guarded by wmu.
 	sent uint32
+	// idle is how long the server keeps this lane without a stream (server only; jittered per lane).
+	idle time.Duration
+	// Client only. unauthed: the authentication header is still in prefix (the lane has not been used
+	// yet); preauthTTL is how long such a lane may wait in the pool, below the server's handshake
+	// timeout; idleScale spreads the idle time of the used lane.
+	unauthed   atomic.Bool
+	preauthTTL time.Duration
+	idleScale  float64
 	// base is the scheme whose md5 is exchanged in Settings: the PSK-derived one or an explicit one. The
 	// lane shapes with scheme, which is its own draw from base's family when base is derived.
 	base *paddingScheme
@@ -265,6 +275,9 @@ func (l *lane) write(p []byte) error {
 	if len(l.prefix) > 0 {
 		p = append(l.prefix[:len(l.prefix):len(l.prefix)], p...)
 		l.prefix = nil
+		if !l.server {
+			l.unauthed.Store(false)
+		}
 		if l.prefixTimer != nil {
 			l.prefixTimer.Stop()
 		}
@@ -450,4 +463,9 @@ func (l *lane) settingsText(extra string) []byte {
 		raw = "1"
 	}
 	return []byte("v=2\nraw=" + raw + extra)
+}
+
+// jitter returns d scaled by a random factor in [low, 1].
+func jitter(d time.Duration, low float64) time.Duration {
+	return time.Duration(float64(d) * (low + (1-low)*mrand.Float64()))
 }

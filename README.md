@@ -102,6 +102,7 @@ Outer TLS 1.3:
     {"name": "alice", "psk": "..."},
     {"name": "bob", "psk": "..."}
   ],
+  "fallback": "127.0.0.1:8080",
   "idleTimeout": 180
 }
 ```
@@ -130,6 +131,9 @@ Outer REALITY:
 | `reality.privateKey` | X25519 private key, base64url without padding |
 | `reality.shortIds` | Short ids the client may present, each up to 16 hex digits; the empty string `""` is allowed |
 | `users` | User list: `name` is used in logs only, `psk` is the credential (at least 16 characters, used as the string it is, not base64-decoded) |
+| `fallback` | TLS only, strongly recommended: `host:port` of a web server (nginx and the like) that gets every connection that is not a client — what was already read, then everything that follows — so that probes are answered as that web server answers them. Without it they get no answer and are closed when `handshakeTimeout` is up |
+| `alpn` | TLS only: what the outer TLS offers to negotiate, `["http/1.1"]` by default. Offer only what the fallback speaks |
+| `handshakeTimeout` | How many seconds a connection may take to present its credentials, 60 by default (as long as web servers wait for a request; a client's pre-connected lane may stay silent until its first use) |
 | `idleTimeout` | How many seconds a lane without a stream is kept, 180 by default. Sent to the client |
 | `paddingScheme` | Optional; overrides the built-in packet-length shaping scheme, one array element per line, e.g. `["stop=8", "0=30-30", "1=100-400"]` |
 

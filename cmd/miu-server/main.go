@@ -48,6 +48,14 @@ type config struct {
 	} `json:"users"`
 	// IdleTimeout is how many seconds a lane without a stream is kept (default 180).
 	IdleTimeout int `json:"idleTimeout"`
+	// HandshakeTimeout is how many seconds a connection may take to present its credentials (default 60).
+	HandshakeTimeout int `json:"handshakeTimeout"`
+	// Fallback (TLS only) is host:port of a web server that gets every connection that is not a client,
+	// so that it is answered as a web server would answer it. Strongly recommended.
+	Fallback string `json:"fallback"`
+	// ALPN (TLS only) is what the outer TLS offers to negotiate; default ["http/1.1"]. Offer only what
+	// the fallback web server speaks.
+	ALPN []string `json:"alpn"`
 	// PaddingScheme overrides the built-in padding scheme, one line per element.
 	PaddingScheme []string `json:"paddingScheme"`
 }
@@ -106,8 +114,9 @@ func main() {
 
 func run(cfg config, verbose bool) error {
 	scfg := miu.ServerConfig{
-		IdleTimeout:   time.Duration(cfg.IdleTimeout) * time.Second,
-		PaddingScheme: strings.Join(cfg.PaddingScheme, "\n"),
+		IdleTimeout:      time.Duration(cfg.IdleTimeout) * time.Second,
+		HandshakeTimeout: time.Duration(cfg.HandshakeTimeout) * time.Second,
+		PaddingScheme:    strings.Join(cfg.PaddingScheme, "\n"),
 		OnAccess: func(a miu.Access) {
 			log.Printf("%s %v -> %s %s", a.User, a.Remote, a.Network, a.Target)
 		},
@@ -152,11 +161,20 @@ func run(cfg config, verbose bool) error {
 		if err != nil {
 			return err
 		}
+		alpn := cfg.ALPN
+		if len(alpn) == 0 {
+			alpn = []string{"http/1.1"}
+		}
 		tlsCfg := &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS13,
+			NextProtos:   alpn,
 			// Records leave with the lengths the padding scheme asks for.
 			DynamicRecordSizingDisabled: true,
+		}
+		scfg.Fallback = cfg.Fallback
+		if cfg.Fallback == "" {
+			log.Printf("no fallback: connections that are not clients get no answer (set \"fallback\" to a web server)")
 		}
 		handshake = func(ctx context.Context, conn net.Conn) (net.Conn, error) {
 			ctx, cancel := context.WithTimeout(ctx, 10*time.Second)

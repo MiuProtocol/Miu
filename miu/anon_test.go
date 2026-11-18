@@ -65,7 +65,7 @@ func TestClientLanesDrawTheirOwnScheme(t *testing.T) {
 	}()
 	var lanes []*lane
 	for i := 0; i < 4; i++ {
-		l, err := c.dial(context.Background(), false)
+		l, err := c.dial(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -90,7 +90,7 @@ func TestClientLanesDrawTheirOwnScheme(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c2.Close()
-	l2, err := c2.dial(context.Background(), true)
+	l2, err := c2.dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -29,15 +29,21 @@ token(32) · padlen(u16 BE) · padding(padlen)
 token = sha256(psk string)        // the UTF-8 bytes of the configured string with leading and trailing whitespace removed; not base64-decoded
 ```
 
-- The server looks the user up by token and closes the connection when there is no match. The psk string must be
-  byte-for-byte identical on both ends.
+- The server looks the user up by token. The psk string must be byte-for-byte identical on both ends.
+- A connection that does not present a known token is not a client. The server answers it the way something other
+  than Miu would: it hands it, with the bytes already read, to a fallback web server when one is configured, and
+  otherwise reads and drops what it sends until the handshake timeout, then closes it. The timeout should be as long
+  as web servers wait for a request (the reference implementation: 60 s). Over TLS a first record shorter than the
+  header cannot come from a client (the client writes header, padding and Settings at once) and need not be waited
+  on. With REALITY this does not arise: such connections never get past REALITY.
 - `padlen` is entry 0 of the padding scheme (30 by default).
 - The Settings frame follows the authentication header immediately (in the same write). After that the client may open
   a stream at any time, **without waiting for any reply**.
-- A lane dialed for a stream holds the header and Settings back until the stream's opening packet (§5) and sends them
-  at its start, in the same record, so that a new connection does not open with a short record of its own. A lane
-  dialed to warm the pool sends them at once, and so does a lane that goes back to the pool before anything was
-  written on it. Either way nothing is waited for.
+- The client holds the header and Settings back until the lane's first write — the opening packet (§5) of the stream
+  that uses it — and sends them at its start, in the same record, so that a connection does not open with a short
+  record of its own. This holds for a lane dialed to warm the pool as well: it sends nothing until it is used, and if
+  it is not used within the server's handshake timeout (the reference client: 44–55 s) it is closed unused, as a
+  browser's pre-connection would be. Either way nothing is waited for.
 
 ## 3. Frames
 
@@ -182,10 +188,17 @@ stop=8
 ```
 
 - Entry 0: the length of the padding after the authentication header.
-- Packet numbers start at 1 **per stream and per direction**. Each batch of data in the DATA phase is one packet (the
-  client's packet 1 = OPEN · first DATA). A packet whose number is below stop is cut into TLS records of the prescribed
-  lengths, filled up with PAD frames where the data is short; whatever is left when the scheme runs out follows in one
-  piece. `c` means "stop here if the data has all been sent, otherwise keep cutting".
+- Packet numbers start at 1 **per lane and per direction** and go on across the streams the lane carries: only the
+  start of a lane is shaped. (Shaping every stream would repeat the scheme's lengths at the start of every stream
+  on the lane, which is easy to see.) Each batch of data in the DATA phase is one packet (the first stream's first
+  packet = OPEN · first DATA). A packet whose number is below stop is cut into TLS records of the prescribed lengths,
+  filled up with PAD frames where the data is short; whatever is left when the scheme runs out follows in one piece.
+  `c` means "stop here if the data has all been sent, otherwise keep cutting".
+- Shaping is the sender's business; the receiver never checks it. When the scheme is the PSK-derived one, each side
+  shapes each lane with a scheme of the lane's own, drawn from the same family: the same generator and bounds, fed
+  by HKDF over the token with a random per-lane nonce (info `miu/v2/padding-profile/v1/psk-only/lane/` followed by
+  the nonce in hex). It is not announced: `padding-md5` in Settings stays that of the PSK-derived scheme. A scheme
+  that is configured, or pushed by the server, is used as it is on every lane.
 - RAW frames and raw segments are not shaped (once in the raw phase there are no "packets" any more).
 - **END is not shaped by the scheme, and it is the last byte of its direction**: no PAD and no record of any kind may
   follow END (a PAD in front of it, in the same record, is fine — see small records below).
@@ -216,17 +229,15 @@ stop=8
 
 | Item | Value |
 |---|---|
-| Idle lane retention | The 4 most recently returned lanes for 120 s, the rest for 30 s; never more than the server's `idle` − 5 s (the server's default `idle` is 180) |
+| Idle lane retention | The 4 most recently returned lanes for 120 s, the rest for 30 s; never more than the server's `idle` − 5 s (the server's default `idle` is 180). Each lane shortens its time by a random 0–20% (and the server its `idle` by 0–15%), so that lane lifetimes do not pile up at a few values |
 | Idle lane limit | 32 (16 is reasonable on memory-constrained mobile devices); beyond that the oldest is closed |
-| Pre-warming | When the previous stream was opened within the last 10 s, top the idle lanes up to 2 (complete the outer handshake, send the authentication header and Settings, and leave them there) |
+| Pre-warming | When the previous stream was opened within the last 10 s, top the idle lanes up to 2 (complete the outer handshake and leave them there; the authentication header and Settings wait for the first use, and an unused lane is closed after 44–55 s) |
 | Taking a lane | Last in, first out. Before taking one, peek without reading data; if the peer has closed it, drop it and try the next |
 | Opening a stream | Wait at most 10 ms for the application's first data and merge it into the same packet as OPEN; if none arrives, send OPEN on its own |
 
 - Why 4 lanes are kept for 120 s: two clicks are often more than half a minute apart, and with an empty pool the next
   one needs a handshake again. Idle lanes send no heartbeats, so keeping a few more costs almost nothing.
-- No data should arrive on a used lane while it is idle: if it does, the server is closing the lane; drop it. This
-  does not apply to a pre-warmed lane that has never been used: the server's ServerSettings stays unread in the
-  socket, so seeing data in the peek before use is normal there.
+- No data should arrive on a lane while it is idle: if it does, the server is closing the lane; drop it.
 - After a network change (Wi-Fi ↔ cellular) every lane in the pool is dead; empty the whole pool.
 - Replay on a dead lane (recommended): the peek before use does not reveal every dead lane (an expired NAT entry, a peer
   that vanished silently). If the stream was opened on a lane taken from the pool, has not yet received any downlink,

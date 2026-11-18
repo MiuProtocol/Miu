@@ -6,5 +6,6 @@
     {"name": "alice", "psk": "REPLACE-WITH-OUTPUT-OF-openssl-rand-base64-32"},
     {"name": "bob", "psk": "REPLACE-WITH-ANOTHER-RANDOM-STRING-0123456789"}
   ],
+  "fallback": "127.0.0.1:8080",
   "idleTimeout": 180
 }

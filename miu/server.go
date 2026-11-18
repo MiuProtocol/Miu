@@ -3,6 +3,7 @@ package miu
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -18,9 +19,12 @@ import (
 const (
 	authHead = 32 + 2 // token · padlen
 
-	defaultIdleTimeout      = 180 * time.Second
-	defaultStreamTimeout    = 300 * time.Second
-	defaultHandshakeTimeout = 4 * time.Second
+	defaultIdleTimeout   = 180 * time.Second
+	defaultStreamTimeout = 300 * time.Second
+	// defaultHandshakeTimeout: as long as web servers wait for a request (nginx's client_header_timeout),
+	// so that a connection that sends nothing is closed when theirs would be. A client's warm lane may
+	// also stay silent this long before its first use.
+	defaultHandshakeTimeout = 60 * time.Second
 	defaultDialTimeout      = 10 * time.Second
 
 	// pskMinLen is the shortest PSK string accepted.
@@ -94,8 +98,13 @@ type ServerConfig struct {
 	IdleTimeout time.Duration
 	// StreamTimeout closes a lane whose stream has been silent in both directions for this long (default 300s).
 	StreamTimeout time.Duration
-	// HandshakeTimeout bounds the wait for the authentication header (default 4s).
+	// HandshakeTimeout bounds the wait for the authentication header (default 60s).
 	HandshakeTimeout time.Duration
+	// Fallback, when set, is the address (host:port) of a web server that gets every connection that is
+	// not a client: the bytes already read, then everything that follows, both ways. Without it such a
+	// connection is read and dropped until HandshakeTimeout, and then closed. Only the outer TLS of the
+	// Miu server faces these connections; with REALITY they never get this far.
+	Fallback string
 	// DisableRaw turns raw segments off: the server declares raw=0 and never sends any.
 	DisableRaw bool
 	// Dial connects to a TCP target. The default is a net.Dialer with a 10s timeout.
@@ -192,11 +201,16 @@ func (s *Server) Serve(ctx context.Context, conn net.Conn) error {
 
 	// The authentication header: token(32) · padlen(u16) · padding. Read piece by piece and never ahead.
 	var h [authHead]byte
-	if _, err := io.ReadFull(conn, h[:]); err != nil {
-		return fmt.Errorf("miu: auth failed: %w", err)
+	n, err := readAuthHead(conn, h[:])
+	user, ok := "", false
+	if n == authHead {
+		user, ok = s.users[[32]byte(h[:32])]
 	}
-	user, ok := s.users[[32]byte(h[:32])]
 	if !ok {
+		s.notAClient(ctx, conn, h[:n])
+		if n < authHead && err != nil {
+			return fmt.Errorf("miu: auth failed: %w", err)
+		}
 		return ErrAuth
 	}
 	if padlen := int64(binary.BigEndian.Uint16(h[32:])); padlen > 0 {
@@ -206,6 +220,8 @@ func (s *Server) Serve(ctx context.Context, conn net.Conn) error {
 	}
 
 	l := newLane(conn, true, !s.cfg.DisableRaw)
+	// Each lane gets its own idle timeout, so that lane lifetimes do not all end at the same mark.
+	l.idle = jitter(s.cfg.IdleTimeout, 0.85)
 	token := [32]byte(h[:32])
 	base, err := s.schemeForToken(token)
 	if err != nil {
@@ -259,7 +275,7 @@ func (s *Server) Serve(ctx context.Context, conn net.Conn) error {
 		return err
 	}
 
-	_ = conn.SetReadDeadline(time.Now().Add(s.cfg.IdleTimeout))
+	_ = conn.SetReadDeadline(time.Now().Add(l.idle))
 	for {
 		typ, payload, err := l.next()
 		if err != nil {
@@ -312,7 +328,7 @@ func (s *Server) Serve(ctx context.Context, conn net.Conn) error {
 				if err := s.serveUDP(ctx, l, user); err != nil {
 					return err
 				}
-				_ = conn.SetReadDeadline(time.Now().Add(s.cfg.IdleTimeout))
+				_ = conn.SetReadDeadline(time.Now().Add(l.idle))
 				continue
 			}
 			dest := joinHostPort(host, port)
@@ -338,7 +354,7 @@ const settingsWait = time.Second
 func (s *Server) handleSettings(l *lane, text string) error {
 	kv := parseKV(text)
 	l.peerRaw.Store(kv["raw"] == "1")
-	reply := appendFrame(nil, frServerSettings, l.settingsText(fmt.Sprintf("\nidle=%d", int(s.cfg.IdleTimeout/time.Second))))
+	reply := appendFrame(nil, frServerSettings, l.settingsText(fmt.Sprintf("\nidle=%d", int(l.idle/time.Second))))
 	// The client is told the scheme its lanes should come from when its md5 is not that of the lane's
 	// base (the PSK-derived scheme, or the configured one).
 	base := l.base
@@ -573,7 +589,7 @@ func (st *tcpStream) mark(up, down bool) {
 	st.mu.Unlock()
 	if done {
 		st.release()
-		_ = st.l.conn.SetReadDeadline(time.Now().Add(st.s.cfg.IdleTimeout))
+		_ = st.l.conn.SetReadDeadline(time.Now().Add(st.l.idle))
 	}
 }
 
@@ -822,4 +838,62 @@ loop:
 		st.traffic.addDown(last, true)
 	}
 	return l.writeFrame(frEnd, nil)
+}
+
+// readAuthHead reads the authentication header into h. Over TLS a single Read returns at most the rest
+// of the current record, and a client writes the header together with its padding and Settings: a first
+// record shorter than the header does not come from a client, and there is no point waiting for more.
+func readAuthHead(conn net.Conn, h []byte) (int, error) {
+	if _, isTLS := conn.(interface{ ConnectionState() tls.ConnectionState }); !isTLS {
+		return io.ReadFull(conn, h)
+	}
+	return conn.Read(h)
+}
+
+// notAClient deals with a connection that did not present a valid header: it goes to the fallback web
+// server (consumed first) when there is one; otherwise what it sends is read and dropped until the
+// handshake deadline. Either way it is answered the way something other than Miu would answer it.
+func (s *Server) notAClient(ctx context.Context, conn net.Conn, consumed []byte) {
+	if s.cfg.Fallback == "" {
+		_, _ = io.Copy(io.Discard, conn)
+		return
+	}
+	d := net.Dialer{Timeout: defaultDialTimeout}
+	back, err := d.DialContext(ctx, "tcp", s.cfg.Fallback)
+	if err != nil {
+		s.logf("miu: fallback %s: %v", s.cfg.Fallback, err)
+		_, _ = io.Copy(io.Discard, conn)
+		return
+	}
+	defer back.Close()
+	_ = conn.SetReadDeadline(time.Time{})
+	if len(consumed) > 0 {
+		if _, err := back.Write(consumed); err != nil {
+			return
+		}
+	}
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(back, conn)
+		if cw, ok := back.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(conn, back)
+		if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		} else {
+			_ = conn.Close()
+		}
+		done <- struct{}{}
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+	_ = conn.Close()
+	_ = back.Close()
+	<-done
 }

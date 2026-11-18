@@ -93,6 +93,7 @@ miu-server keygen            # 生成一对 REALITY 密钥
     {"name": "alice", "psk": "..."},
     {"name": "bob", "psk": "..."}
   ],
+  "fallback": "127.0.0.1:8080",
   "idleTimeout": 180
 }
 ```
@@ -121,6 +122,9 @@ miu-server keygen            # 生成一对 REALITY 密钥
 | `reality.privateKey` | X25519 私钥,base64url 无填充 |
 | `reality.shortIds` | 客户端可以出示的 short id,每个是最多 16 位十六进制;可以包含空串 `""` |
 | `users` | 用户列表:`name` 只用于日志,`psk` 是凭据(至少 16 个字符,按字符串原样使用,不做 base64 解码) |
+| `fallback` | 仅 TLS,强烈建议配置:一个 Web 服务器(nginx 之类)的 `host:port`。不是客户端的连接——已经读到的字节加上之后的全部——交给它,探测者得到的就是那个 Web 服务器的回应。不配置时这些连接得不到任何回应,`handshakeTimeout` 到了就关 |
+| `alpn` | 仅 TLS:外层 TLS 可协商的 ALPN,默认 `["http/1.1"]`。只写回落 Web 服务器支持的 |
+| `handshakeTimeout` | 连接最多用多少秒出示凭据,默认 60(与常见 Web 服务器等请求的时间相当;客户端预先建好的通道在第一次使用前可以一直不说话) |
 | `idleTimeout` | 没有流的通道保留多少秒,默认 180。会下发给客户端 |
 | `paddingScheme` | 可选,覆盖内建的包长整形方案,每行一个数组元素,如 `["stop=8", "0=30-30", "1=100-400"]` |
 
