@@ -286,6 +286,15 @@ func (s *Server) Serve(ctx context.Context, conn net.Conn) error {
 			if cur == nil || cur.upEnded() {
 				return errors.New("miu: data outside of a stream")
 			}
+			if typ == frRaw {
+				handled, err := cur.spliceUp(l)
+				if err != nil {
+					return nil // the lane was closed (see spliceUp)
+				}
+				if handled {
+					continue // the segment went straight to the target; read the next frame
+				}
+			}
 			for l.pending() {
 				b := getBuf()
 				n, err := l.readPayload(*b)
@@ -294,7 +303,7 @@ func (s *Server) Serve(ctx context.Context, conn net.Conn) error {
 					return nil
 				}
 				cur.traffic.addUp(n, typ == frRaw)
-				if !cur.push(chunk{b, n}) {
+				if !cur.push(chunk{buf: b, n: n}) {
 					return nil
 				}
 			}
@@ -402,10 +411,13 @@ func (a *activityTimer) stop() {
 	a.t.Stop()
 }
 
-// chunk is a piece of uplink payload in a pooled buffer.
+// chunk is a piece of uplink payload in a pooled buffer. A chunk with barrier != nil carries no payload:
+// it is a marker the uplink writer closes once it has written everything queued before it, so the read
+// loop can splice the next raw segment straight to the target without racing the writer.
 type chunk struct {
-	buf *[]byte
-	n   int
+	buf     *[]byte
+	n       int
+	barrier chan struct{}
 }
 
 // tcpStream is the TCP stream running on a lane (server side). The lane's read loop feeds the uplink
@@ -494,6 +506,10 @@ func (st *tcpStream) pumpUp(target net.Conn, done chan struct{}) {
 	defer close(done)
 	dead := false
 	for c := range st.up {
+		if c.barrier != nil {
+			close(c.barrier) // everything queued before this has been written; the read loop may splice now
+			continue
+		}
 		if !dead {
 			_, err := target.Write((*c.buf)[:c.n])
 			dead = err != nil
@@ -516,6 +532,63 @@ func (st *tcpStream) push(c chunk) bool {
 		return false
 	}
 }
+
+// spliceUp moves a raw uplink segment straight from the tunnel socket to the target, the mirror of the
+// downlink's spliceRaw: on Linux the bytes never enter user space. handled is false when the fast path
+// does not apply (not both ends TCP, or no target yet) and the caller reads the segment the usual way.
+//
+// Trade-off vs the buffered path: splice fuses the read and the write, so a target write that fails part
+// way leaves the tunnel socket an unknown number of bytes past the segment boundary. The segment can no
+// longer be framed, so the lane is closed — unlike the buffered path, which reads the whole segment first
+// and merely drops the upload on a target failure while keeping the lane. A target failing in the middle
+// of an upload is uncommon, and it costs at most one re-dialed lane.
+func (st *tcpStream) spliceUp(l *lane) (handled bool, err error) {
+	sock, ok := l.sock.(*net.TCPConn)
+	if !ok {
+		return false, nil
+	}
+	st.mu.Lock()
+	target, _ := st.target.(*net.TCPConn)
+	st.mu.Unlock()
+	if target == nil {
+		return false, nil
+	}
+	// Flush bytes the TLS layer already read past the record (l.rin) through the queue, so the rest of
+	// the segment is on the socket and in order behind anything queued before it.
+	for l.rin != nil && l.rin.Len() > 0 && l.rawLeft > 0 {
+		b := getBuf()
+		n, e := l.readPayload(*b)
+		if e != nil {
+			putBuf(b)
+			return true, e
+		}
+		st.traffic.addUp(n, true)
+		if !st.push(chunk{buf: b, n: n}) {
+			return true, errLaneGone
+		}
+	}
+	if l.rawLeft == 0 {
+		return true, nil
+	}
+	// Wait until the writer has drained everything queued before this segment, then it is idle and the
+	// splice is the only write to the target.
+	bar := make(chan struct{})
+	if !st.push(chunk{barrier: bar}) {
+		return true, errLaneGone
+	}
+	<-bar
+	n := l.rawLeft
+	w, e := io.CopyN(target, sock, n)
+	l.rawLeft -= w
+	st.traffic.addUp(int(w), true)
+	if e != nil || w != n {
+		l.close() // the socket is past the boundary (see the trade-off above); the lane cannot go on
+		return true, e
+	}
+	return true, nil
+}
+
+var errLaneGone = errors.New("miu: lane closed")
 
 func (st *tcpStream) upEnded() bool {
 	st.mu.Lock()
