@@ -23,8 +23,8 @@ The wire format and the required behaviour are specified in [PROTOCOL.md](PROTOC
 - **Inner TLS 1.3 forwarded as is.** The record boundaries of the inner TLS are tracked along the way. After the inner
   handshake, inner ciphertext records are no longer wrapped in the outer encryption: one record holding only a RAW frame
   declares a byte count, and that many bytes follow directly on TCP. Plaintext, the plaintext part of the inner
-  handshake, and TLS 1.2 stay inside the outer encryption. On Linux the server's downlink uses splice, so the data never
-  enters user space.
+  handshake, and TLS 1.2 stay inside the outer encryption. On Linux both directions use splice — the server's downlink from the target and the uplink to it — so the raw bytes
+  never enter user space.
 - **Aborting does not waste the lane.** When the application closes a connection the client sends RESET, discards the
   rest of the downlink up to the server's END, and the lane goes back to the pool.
 - The first few packets of each stream are shaped by a padding scheme (AnyTLS's scheme format; the server can push its
@@ -265,7 +265,7 @@ That document is written for an AI coding assistant to follow. A fork of mihomo 
 
 - TCP; UDP (UoT v2, one UDP socket per session on the server, full-cone)
 - Outer TLS 1.3 (standard library, or Chrome fingerprint) and REALITY (Chrome fingerprint on the client)
-- Raw segments in both directions; on Linux the server's downlink uses splice + TCP_CORK, other platforms copy in user space
+- Raw segments in both directions; on Linux both the downlink and the uplink use splice (+ TCP_CORK on the downlink), other platforms copy in user space
 - Lane pool: last in first out, two retention tiers, pre-warming while streams are being opened in quick succession, a liveness check before use, replay on a dead lane
 - Packet-length shaping, with the scheme pushed by the server; RESET abort; half-close
 - Multiple users; access log
