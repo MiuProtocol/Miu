@@ -1147,3 +1147,47 @@ func TestAccessAndTraffic(t *testing.T) {
 		t.Fatalf("udp session: %+v", tr)
 	}
 }
+
+// A lane dialed to warm the pool sits unused while the server's post-handshake records (session tickets:
+// a REALITY server sends them after the client's Finished) land in its socket. Taking it must not mistake
+// them for the server closing the lane: the lane is used, not closed and replaced by a fresh dial.
+func TestWarmLaneSurvivesSessionTickets(t *testing.T) {
+	for _, outer := range []string{"tls", "reality"} {
+		t.Run(outer, func(t *testing.T) {
+			count := collectEvents(t)
+			echo := listen(t, func(c net.Conn) { defer c.Close(); _, _ = io.Copy(c, c) })
+			c := pair(t, pairOptions{outer: outer})
+			hold := func() net.Conn {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				conn, err := c.DialContext(ctx, "tcp", echo)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := conn.Write([]byte("ping")); err != nil {
+					t.Fatal(err)
+				}
+				b := make([]byte, 4)
+				if _, err := io.ReadFull(conn, b); err != nil {
+					t.Fatal(err)
+				}
+				return conn
+			}
+			a := hold() // lane 1
+			b := hold() // lane 2, and a burst: one lane is warmed in the background
+			defer a.Close()
+			defer b.Close()
+			time.Sleep(500 * time.Millisecond) // the warm lane's handshake is done and its tickets are in
+			if d := count("client:dial"); d != 3 {
+				t.Fatalf("dials before the third stream = %d, want 3", d)
+			}
+			third := hold() // must take the warm lane
+			third.Close()
+			if d, r := count("client:dial"), count("client:reuse"); d != 3 || r < 1 {
+				t.Fatalf("dials=%d reuse=%d: the warm lane was thrown away", d, r)
+			}
+			// Taking it was a burst too: let that background dial land here, not in the next test's count.
+			time.Sleep(500 * time.Millisecond)
+		})
+	}
+}
